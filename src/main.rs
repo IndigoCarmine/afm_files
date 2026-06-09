@@ -1,3 +1,4 @@
+#![windows_subsystem = "windows"]
 mod analysis;
 mod app;
 mod colormap;
