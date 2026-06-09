@@ -31,6 +31,24 @@ impl Colormap {
     }
 }
 
+pub fn to_rgba_bytes(
+    data: &[f32],
+    rows: usize,
+    cols: usize,
+    cmap: Colormap,
+    z_min: f32,
+    z_max: f32,
+) -> Vec<u8> {
+    let range = (z_max - z_min).max(f32::EPSILON);
+    let mut bytes = Vec::with_capacity(rows * cols * 4);
+    for &v in data {
+        let t = (v - z_min) / range;
+        let [r, g, b] = cmap.map_u8(t);
+        bytes.extend_from_slice(&[r, g, b, 255]);
+    }
+    bytes
+}
+
 pub fn to_color_image(
     data: &[f32],
     rows: usize,
@@ -51,12 +69,17 @@ pub fn to_color_image(
     ColorImage::new([cols, rows], pixels)
 }
 
+fn sigmoid(t: f32, sigma: f32, z: f32) -> f32 {
+    1.0 / (1.0 + (-sigma * (t - z)).exp())
+}
+
 // afmhot: R rises first (0→1/3), then G (1/3→2/3), then B (2/3→1)
 // Result: black → deep red → orange → yellow → white
 fn afm_hot(t: f32) -> [u8; 3] {
-    let r = (t * 3.0).clamp(0.0, 1.0);
-    let g = (t * 3.0 - 1.0).clamp(0.0, 1.0);
-    let b = (t * 3.0 - 2.0).clamp(0.0, 1.0);
+    let t = t * 0.8 + 0.2; // shift and scale to make the colors more vibrant
+    let r = (sigmoid(t, 7.0, 0.6) * 1.05).clamp(0.0, 1.0);
+    let g = (sigmoid(t, 10.0, 0.7) * 1.1 - 0.05).clamp(0.0, 1.0);
+    let b = (sigmoid(t, 11.0, 0.7) * 1.6 - 0.55).clamp(0.0, 1.0);
     [(r * 255.0) as u8, (g * 255.0) as u8, (b * 255.0) as u8]
 }
 

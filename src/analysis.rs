@@ -1,3 +1,4 @@
+use crate::colormap::{to_rgba_bytes, Colormap};
 use crate::parser::SpmImage;
 use image::{ImageBuffer, Rgb};
 use std::path::Path;
@@ -38,6 +39,22 @@ pub fn line_profile(image: &SpmImage, p0: (f32, f32), p1: (f32, f32)) -> Vec<(f3
     }
 
     profile
+}
+
+pub fn export_afm_image(
+    data: &[f32],
+    rows: usize,
+    cols: usize,
+    cmap: Colormap,
+    z_min: f32,
+    z_max: f32,
+    path: &Path,
+) -> Result<(), String> {
+    let rgba = to_rgba_bytes(data, rows, cols, cmap, z_min, z_max);
+    let img: image::ImageBuffer<image::Rgba<u8>, _> =
+        image::ImageBuffer::from_raw(cols as u32, rows as u32, rgba)
+            .ok_or_else(|| "Failed to create image buffer".to_string())?;
+    img.save(path).map_err(|e| format!("Failed to save image: {e}"))
 }
 
 pub fn export_csv(profile: &[(f32, f32)], path: &Path) -> Result<(), String> {

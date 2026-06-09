@@ -1,5 +1,5 @@
-use crate::analysis::{export_csv, export_profile_png, line_profile};
-use crate::colormap::{to_color_image, Colormap};
+use crate::analysis::{export_afm_image, export_csv, export_profile_png, line_profile};
+use crate::colormap::{to_color_image, to_rgba_bytes, Colormap};
 use crate::parser::{load_spm, ChannelInfo, SpmImage};
 use egui::{TextureHandle, TextureOptions, Vec2};
 use egui_plot::{Line, Plot, PlotPoints, Points, VLine};
@@ -92,20 +92,14 @@ impl Default for AfmViewerApp {
 fn frac_to_screen(frac: egui::Pos2, rect: egui::Rect, zoom: f32, pan: Vec2) -> egui::Pos2 {
     let origin = image_origin(rect, zoom, pan);
     let size = rect.size() * zoom;
-    egui::pos2(
-        origin.x + frac.x * size.x,
-        origin.y + frac.y * size.y,
-    )
+    egui::pos2(origin.x + frac.x * size.x, origin.y + frac.y * size.y)
 }
 
 /// Map a screen position back to fractional image coordinates.
 fn screen_to_frac(pos: egui::Pos2, rect: egui::Rect, zoom: f32, pan: Vec2) -> egui::Pos2 {
     let origin = image_origin(rect, zoom, pan);
     let size = rect.size() * zoom;
-    egui::pos2(
-        (pos.x - origin.x) / size.x,
-        (pos.y - origin.y) / size.y,
-    )
+    egui::pos2((pos.x - origin.x) / size.x, (pos.y - origin.y) / size.y)
 }
 
 /// Top-left corner of the (possibly zoomed + panned) image inside `rect`.
@@ -116,9 +110,7 @@ fn image_origin(rect: egui::Rect, zoom: f32, pan: Vec2) -> egui::Pos2 {
 }
 
 fn is_spm_file(path: &std::path::Path) -> bool {
-    let ext = path
-        .extension()
-        .map(|e| e.to_string_lossy().to_lowercase());
+    let ext = path.extension().map(|e| e.to_string_lossy().to_lowercase());
     match ext.as_deref() {
         Some("spm") => true,
         Some(e) => e.chars().all(|c| c.is_ascii_digit()),
@@ -127,7 +119,9 @@ fn is_spm_file(path: &std::path::Path) -> bool {
 }
 
 fn nice_scale(hint: f32) -> f32 {
-    let nice = [1.0_f32, 2.0, 5.0, 10.0, 20.0, 50.0, 100.0, 200.0, 500.0, 1000.0];
+    let nice = [
+        1.0_f32, 2.0, 5.0, 10.0, 20.0, 50.0, 100.0, 200.0, 500.0, 1000.0,
+    ];
     nice.iter()
         .copied()
         .min_by_key(|&v| ((v - hint).abs() * 1000.0) as i64)
@@ -141,7 +135,12 @@ impl AfmViewerApp {
         self.load_file_channel(ctx, idx, None);
     }
 
-    fn load_file_channel(&mut self, ctx: &egui::Context, idx: usize, channel_override: Option<Option<usize>>) {
+    fn load_file_channel(
+        &mut self,
+        ctx: &egui::Context,
+        idx: usize,
+        channel_override: Option<Option<usize>>,
+    ) {
         let path = self.files[idx].clone();
         let is_new_file = self.selected != Some(idx);
         self.selected = Some(idx);
@@ -188,8 +187,15 @@ impl AfmViewerApp {
     }
 
     fn rebuild_texture(&mut self, ctx: &egui::Context, img: &SpmImage) {
-        let ci = to_color_image(&img.data, img.number_of_lines, img.samps_per_line, self.colormap, self.z_min, self.z_max);
-        self.texture = Some(ctx.load_texture("afm_image", ci, TextureOptions::LINEAR));
+        let ci = to_color_image(
+            &img.data,
+            img.number_of_lines,
+            img.samps_per_line,
+            self.colormap,
+            self.z_min,
+            self.z_max,
+        );
+        self.texture = Some(ctx.load_texture("afm_image", ci, TextureOptions::NEAREST));
     }
 
     fn scan_folder(&mut self, folder: PathBuf) {
@@ -232,43 +238,19 @@ impl AfmViewerApp {
                 });
             if self.colormap != prev_cmap {
                 if let Some(img) = &self.image {
-                    let ci = to_color_image(&img.data, img.number_of_lines, img.samps_per_line, self.colormap, self.z_min, self.z_max);
-                    self.texture =
-                        Some(ctx.load_texture("afm_image", ci, TextureOptions::LINEAR));
+                    let ci = to_color_image(
+                        &img.data,
+                        img.number_of_lines,
+                        img.samps_per_line,
+                        self.colormap,
+                        self.z_min,
+                        self.z_max,
+                    );
+                    self.texture = Some(ctx.load_texture("afm_image", ci, TextureOptions::NEAREST));
                 }
             }
 
             ui.separator();
-
-            if !self.available_channels.is_empty() {
-                ui.label("Channel:");
-                let prev_ch = self.channel_idx;
-                let current_name = self
-                    .available_channels
-                    .iter()
-                    .find(|c| c.index == self.channel_idx)
-                    .map(|c| c.name.clone())
-                    .unwrap_or_else(|| format!("Ch {}", self.channel_idx));
-                egui::ComboBox::from_id_salt("channel")
-                    .selected_text(&current_name)
-                    .show_ui(ui, |ui| {
-                        for ch in &self.available_channels.clone() {
-                            let label = if ch.direction.is_empty() {
-                                ch.name.clone()
-                            } else {
-                                format!("{} ({})", ch.name, ch.direction)
-                            };
-                            ui.selectable_value(&mut self.channel_idx, ch.index, label);
-                        }
-                    });
-                if self.channel_idx != prev_ch {
-                    if let Some(idx) = self.selected {
-                        self.load_file_channel(ctx, idx, Some(Some(self.channel_idx)));
-                    }
-                }
-
-                ui.separator();
-            }
 
             ui.label("Flatten:");
             let orders: &[Option<u32>] = &[None, Some(0), Some(1), Some(2), Some(3)];
@@ -359,13 +341,21 @@ impl AfmViewerApp {
         ui.horizontal(|ui| {
             ui.label("Z min:");
             let prev = self.z_min;
-            ui.add(egui::DragValue::new(&mut self.z_min).speed(0.1).suffix(" nm"));
+            ui.add(
+                egui::DragValue::new(&mut self.z_min)
+                    .speed(0.1)
+                    .suffix(" nm"),
+            );
             if (self.z_min - prev).abs() > f32::EPSILON {
                 z_changed = true;
             }
             ui.label("Z max:");
             let prev = self.z_max;
-            ui.add(egui::DragValue::new(&mut self.z_max).speed(0.1).suffix(" nm"));
+            ui.add(
+                egui::DragValue::new(&mut self.z_max)
+                    .speed(0.1)
+                    .suffix(" nm"),
+            );
             if (self.z_max - prev).abs() > f32::EPSILON {
                 z_changed = true;
             }
@@ -377,10 +367,70 @@ impl AfmViewerApp {
         });
         if z_changed {
             if let Some(img) = &self.image {
-                let ci = to_color_image(&img.data, img.number_of_lines, img.samps_per_line, self.colormap, self.z_min, self.z_max);
-                self.texture = Some(ctx.load_texture("afm_image", ci, TextureOptions::LINEAR));
+                let ci = to_color_image(
+                    &img.data,
+                    img.number_of_lines,
+                    img.samps_per_line,
+                    self.colormap,
+                    self.z_min,
+                    self.z_max,
+                );
+                self.texture = Some(ctx.load_texture("afm_image", ci, TextureOptions::NEAREST));
             }
         }
+
+        ui.horizontal(|ui| {
+            if ui.button("💾 Save Image").clicked() {
+                if let Some(ref img) = self.image {
+                    if let Some(path) = rfd::FileDialog::new()
+                        .add_filter("PNG", &["png"])
+                        .save_file()
+                    {
+                        match export_afm_image(
+                            &img.data,
+                            img.number_of_lines,
+                            img.samps_per_line,
+                            self.colormap,
+                            self.z_min,
+                            self.z_max,
+                            &path,
+                        ) {
+                            Ok(_) => self.status_msg = "Image saved.".to_string(),
+                            Err(e) => self.status_msg = format!("Save error: {e}"),
+                        }
+                    }
+                }
+            }
+            if ui.button("📋 Copy to Clipboard").clicked() {
+                if let Some(ref img) = self.image {
+                    let rgba = to_rgba_bytes(
+                        &img.data,
+                        img.number_of_lines,
+                        img.samps_per_line,
+                        self.colormap,
+                        self.z_min,
+                        self.z_max,
+                    );
+                    match arboard::Clipboard::new() {
+                        Ok(mut cb) => {
+                            let img_data = arboard::ImageData {
+                                width: img.samps_per_line,
+                                height: img.number_of_lines,
+                                bytes: std::borrow::Cow::Owned(rgba),
+                            };
+                            match cb.set_image(img_data) {
+                                Ok(_) => self.status_msg = "Copied to clipboard.".to_string(),
+                                Err(e) => self.status_msg = format!("Clipboard error: {e}"),
+                            }
+                        }
+                        Err(e) => self.status_msg = format!("Clipboard error: {e}"),
+                    }
+                }
+            }
+            if !self.status_msg.is_empty() {
+                ui.label(&self.status_msg.clone());
+            }
+        });
 
         let avail = ui.available_size();
         let base_side = avail.x.min(avail.y) - 20.0;
@@ -431,7 +481,10 @@ impl AfmViewerApp {
             let bar_y = rect.max.y - 12.0;
             let bar_x0 = rect.min.x + 10.0;
             painter.line_segment(
-                [egui::pos2(bar_x0, bar_y), egui::pos2(bar_x0 + bar_px, bar_y)],
+                [
+                    egui::pos2(bar_x0, bar_y),
+                    egui::pos2(bar_x0 + bar_px, bar_y),
+                ],
                 egui::Stroke::new(3.0, egui::Color32::WHITE),
             );
             painter.text(
@@ -560,12 +613,18 @@ impl AfmViewerApp {
             if response.clicked() && self.drag_target.is_none() {
                 if let Some(pos) = response.interact_pointer_pos() {
                     // Ignore click if it landed on an existing handle
-                    let on_p0 = self.line_p0.map(|p| {
-                        (pos - frac_to_screen(p, rect, self.zoom, self.pan)).length() < GRAB_R
-                    }).unwrap_or(false);
-                    let on_p1 = self.line_p1.map(|p| {
-                        (pos - frac_to_screen(p, rect, self.zoom, self.pan)).length() < GRAB_R
-                    }).unwrap_or(false);
+                    let on_p0 = self
+                        .line_p0
+                        .map(|p| {
+                            (pos - frac_to_screen(p, rect, self.zoom, self.pan)).length() < GRAB_R
+                        })
+                        .unwrap_or(false);
+                    let on_p1 = self
+                        .line_p1
+                        .map(|p| {
+                            (pos - frac_to_screen(p, rect, self.zoom, self.pan)).length() < GRAB_R
+                        })
+                        .unwrap_or(false);
 
                     if !on_p0 && !on_p1 {
                         let frac = screen_to_frac(pos, rect, self.zoom, self.pan);
@@ -578,11 +637,9 @@ impl AfmViewerApp {
                         } else {
                             self.line_p1 = Some(frac);
                             if let (Some(p0), Some(ref img)) = (self.line_p0, &self.image) {
-                                self.profile =
-                                    line_profile(img, (p0.x, p0.y), (frac.x, frac.y));
+                                self.profile = line_profile(img, (p0.x, p0.y), (frac.x, frac.y));
                             }
-                            self.status_msg =
-                                format!("{} profile points", self.profile.len());
+                            self.status_msg = format!("{} profile points", self.profile.len());
                         }
                     }
                 }
@@ -606,13 +663,14 @@ impl AfmViewerApp {
                 let sp0 = frac_to_screen(p0, rect, self.zoom, self.pan);
                 if let Some(p1) = self.line_p1 {
                     let sp1 = frac_to_screen(p1, rect, self.zoom, self.pan);
-                    painter.line_segment(
-                        [sp0, sp1],
-                        egui::Stroke::new(2.0, egui::Color32::WHITE),
-                    );
+                    painter.line_segment([sp0, sp1], egui::Stroke::new(2.0, egui::Color32::WHITE));
                     // p1 = red
                     painter.circle_filled(sp1, HANDLE_R, egui::Color32::RED);
-                    painter.circle_stroke(sp1, HANDLE_R, egui::Stroke::new(1.5, egui::Color32::WHITE));
+                    painter.circle_stroke(
+                        sp1,
+                        HANDLE_R,
+                        egui::Stroke::new(1.5, egui::Color32::WHITE),
+                    );
                 }
                 // p0 = green
                 painter.circle_filled(sp0, HANDLE_R, egui::Color32::GREEN);
@@ -649,10 +707,8 @@ impl AfmViewerApp {
                     let ma_h = ma.map(|x| interp_height(x));
                     let mb_h = mb.map(|x| interp_height(x));
 
-                    let curve: PlotPoints = profile
-                        .iter()
-                        .map(|&(d, h)| [d as f64, h as f64])
-                        .collect();
+                    let curve: PlotPoints =
+                        profile.iter().map(|&(d, h)| [d as f64, h as f64]).collect();
 
                     let plot_resp = Plot::new("profile_plot")
                         .width(avail.x * 0.45)
@@ -695,9 +751,7 @@ impl AfmViewerApp {
                                 );
                             }
 
-                            if let (Some(xa), Some(ha), Some(xb), Some(hb)) =
-                                (ma, ma_h, mb, mb_h)
-                            {
+                            if let (Some(xa), Some(ha), Some(xb), Some(hb)) = (ma, ma_h, mb, mb_h) {
                                 plot_ui.line(
                                     Line::new("A-B", vec![[xa, ha], [xb, hb]])
                                         .color(egui::Color32::from_rgba_premultiplied(
@@ -731,52 +785,46 @@ impl AfmViewerApp {
                     // ── Difference readout ────────────────────────────────────
                     egui::Frame::group(ui.style())
                         .inner_margin(egui::Margin::same(8))
-                        .show(ui, |ui| {
-                            match (ma, ma_h, mb, mb_h) {
-                                (Some(xa), Some(ha), Some(xb), Some(hb)) => {
-                                    let dx = xb - xa;
-                                    let dh = hb - ha;
-                                    ui.horizontal(|ui| {
-                                        ui.colored_label(
-                                            egui::Color32::from_rgb(80, 160, 255),
-                                            format!("A  {xa:.2} nm,  {ha:.3} nm"),
-                                        );
-                                        ui.label("→");
-                                        ui.colored_label(
-                                            egui::Color32::from_rgb(240, 80, 80),
-                                            format!("B  {xb:.2} nm,  {hb:.3} nm"),
-                                        );
-                                    });
-                                    ui.separator();
-                                    ui.horizontal(|ui| {
-                                        ui.label(
-                                            egui::RichText::new(format!(
-                                                "ΔD = {dx:+.2} nm"
-                                            ))
-                                            .size(14.0)
-                                            .strong(),
-                                        );
-                                        ui.add_space(16.0);
-                                        ui.label(
-                                            egui::RichText::new(format!(
-                                                "ΔH = {dh:+.3} nm"
-                                            ))
-                                            .size(14.0)
-                                            .strong(),
-                                        );
-                                    });
-                                }
-                                (Some(xa), Some(ha), None, _) => {
+                        .show(ui, |ui| match (ma, ma_h, mb, mb_h) {
+                            (Some(xa), Some(ha), Some(xb), Some(hb)) => {
+                                let dx = xb - xa;
+                                let dh = hb - ha;
+                                ui.horizontal(|ui| {
                                     ui.colored_label(
                                         egui::Color32::from_rgb(80, 160, 255),
                                         format!("A  {xa:.2} nm,  {ha:.3} nm"),
                                     );
-                                    ui.label("← クリックで B を設定");
-                                }
-                                _ => {
-                                    ui.label("プロット上をクリック → A、次のクリック → B");
-                                    ui.label("右クリックでクリア");
-                                }
+                                    ui.label("→");
+                                    ui.colored_label(
+                                        egui::Color32::from_rgb(240, 80, 80),
+                                        format!("B  {xb:.2} nm,  {hb:.3} nm"),
+                                    );
+                                });
+                                ui.separator();
+                                ui.horizontal(|ui| {
+                                    ui.label(
+                                        egui::RichText::new(format!("ΔD = {dx:+.2} nm"))
+                                            .size(14.0)
+                                            .strong(),
+                                    );
+                                    ui.add_space(16.0);
+                                    ui.label(
+                                        egui::RichText::new(format!("ΔH = {dh:+.3} nm"))
+                                            .size(14.0)
+                                            .strong(),
+                                    );
+                                });
+                            }
+                            (Some(xa), Some(ha), None, _) => {
+                                ui.colored_label(
+                                    egui::Color32::from_rgb(80, 160, 255),
+                                    format!("A  {xa:.2} nm,  {ha:.3} nm"),
+                                );
+                                ui.label("← クリックで B を設定");
+                            }
+                            _ => {
+                                ui.label("プロット上をクリック → A、次のクリック → B");
+                                ui.label("右クリックでクリア");
                             }
                         });
 
