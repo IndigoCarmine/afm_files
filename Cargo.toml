@@ -1,0 +1,38 @@
+[package]
+name = "afm_files"
+version = "0.1.0"
+edition = "2021"
+
+[package.metadata.bundle]
+name = "Kuntuba AFM Viewer"
+identifier = "io.github.indigocarmine.kintuba"
+version = "0.1.0"
+
+copyright = "Copyright (c) Yuhei Yamada 2026. All rights reserved."
+
+category = "Science"
+
+short_description = "AFM viewer"
+
+long_description = """
+AFM Viewer is a desktop application for viewing and analyzing
+Bruker Nanoscope SPM files (.spm).
+
+Features include height map display with colormaps (AFM Hot, Gray, Viridis),
+polynomial line flattening, pan/zoom, and line profile analysis with
+marker-based distance and height difference measurements.
+"""
+
+[[bin]]
+name = "afm_viewer"
+path = "src/main.rs"
+
+[dependencies]
+eframe    = "0.34.3"
+egui      = "0.34.3"
+egui_plot = "0.35.0"
+rfd       = "0.17.2"
+image     = "0.25"
+
+[build-dependencies]
+winresource = "0.1"
