@@ -1,6 +1,6 @@
 use crate::analysis::{export_csv, export_profile_png, line_profile};
 use crate::colormap::{to_color_image, Colormap};
-use crate::parser::{load_spm, SpmImage};
+use crate::parser::{load_spm, ChannelInfo, SpmImage};
 use egui::{TextureHandle, TextureOptions, Vec2};
 use egui_plot::{Line, Plot, PlotPoints, Points, VLine};
 use std::path::PathBuf;
@@ -22,9 +22,14 @@ pub struct AfmViewerApp {
     texture: Option<TextureHandle>,
     load_error: Option<String>,
 
+    // Channel selection
+    channel_idx: usize,
+    available_channels: Vec<ChannelInfo>,
+
     // Display controls
     colormap: Colormap,
     flatten_order: Option<u32>,
+    smooth_sigma: f32,
     z_min: f32,
     z_max: f32,
     z_data_min: f32,
@@ -58,8 +63,11 @@ impl Default for AfmViewerApp {
             image: None,
             texture: None,
             load_error: None,
+            channel_idx: 0,
+            available_channels: vec![],
             colormap: Colormap::AfmHot,
             flatten_order: Some(2),
+            smooth_sigma: 0.0,
             z_min: 0.0,
             z_max: 1.0,
             z_data_min: 0.0,
@@ -130,7 +138,12 @@ fn nice_scale(hint: f32) -> f32 {
 
 impl AfmViewerApp {
     fn load_file(&mut self, ctx: &egui::Context, idx: usize) {
+        self.load_file_channel(ctx, idx, None);
+    }
+
+    fn load_file_channel(&mut self, ctx: &egui::Context, idx: usize, channel_override: Option<Option<usize>>) {
         let path = self.files[idx].clone();
+        let is_new_file = self.selected != Some(idx);
         self.selected = Some(idx);
         self.load_error = None;
         self.line_p0 = None;
@@ -142,7 +155,16 @@ impl AfmViewerApp {
         self.zoom = 1.0;
         self.pan = Vec2::ZERO;
 
-        match load_spm(&path, self.flatten_order) {
+        // For new files, auto-detect channel; for reloads use current channel
+        let channel = if let Some(ch) = channel_override {
+            ch
+        } else if is_new_file {
+            None // auto-detect
+        } else {
+            Some(self.channel_idx)
+        };
+
+        match load_spm(&path, self.flatten_order, self.smooth_sigma, channel) {
             Ok(img) => {
                 let z_min = img.data.iter().cloned().fold(f32::INFINITY, f32::min);
                 let z_max = img.data.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
@@ -150,6 +172,10 @@ impl AfmViewerApp {
                 self.z_data_max = z_max;
                 self.z_min = z_min;
                 self.z_max = z_max;
+                if is_new_file {
+                    self.channel_idx = img.channel_idx;
+                }
+                self.available_channels = img.available_channels.clone();
                 self.rebuild_texture(ctx, &img);
                 self.image = Some(img);
             }
@@ -214,6 +240,36 @@ impl AfmViewerApp {
 
             ui.separator();
 
+            if !self.available_channels.is_empty() {
+                ui.label("Channel:");
+                let prev_ch = self.channel_idx;
+                let current_name = self
+                    .available_channels
+                    .iter()
+                    .find(|c| c.index == self.channel_idx)
+                    .map(|c| c.name.clone())
+                    .unwrap_or_else(|| format!("Ch {}", self.channel_idx));
+                egui::ComboBox::from_id_salt("channel")
+                    .selected_text(&current_name)
+                    .show_ui(ui, |ui| {
+                        for ch in &self.available_channels.clone() {
+                            let label = if ch.direction.is_empty() {
+                                ch.name.clone()
+                            } else {
+                                format!("{} ({})", ch.name, ch.direction)
+                            };
+                            ui.selectable_value(&mut self.channel_idx, ch.index, label);
+                        }
+                    });
+                if self.channel_idx != prev_ch {
+                    if let Some(idx) = self.selected {
+                        self.load_file_channel(ctx, idx, Some(Some(self.channel_idx)));
+                    }
+                }
+
+                ui.separator();
+            }
+
             ui.label("Flatten:");
             let orders: &[Option<u32>] = &[None, Some(0), Some(1), Some(2), Some(3)];
             let order_label = |o: Option<u32>| match o {
@@ -233,6 +289,22 @@ impl AfmViewerApp {
                     }
                 });
             if self.flatten_order != prev_order {
+                if let Some(idx) = self.selected {
+                    self.load_file(ctx, idx);
+                }
+            }
+
+            ui.separator();
+
+            ui.label("Smooth σ:");
+            let prev_sigma = self.smooth_sigma;
+            ui.add(
+                egui::DragValue::new(&mut self.smooth_sigma)
+                    .speed(0.1)
+                    .range(0.0..=10.0)
+                    .suffix(" px"),
+            );
+            if (self.smooth_sigma - prev_sigma).abs() > f32::EPSILON {
                 if let Some(idx) = self.selected {
                     self.load_file(ctx, idx);
                 }

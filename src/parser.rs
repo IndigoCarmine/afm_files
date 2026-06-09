@@ -7,6 +7,13 @@ struct ImageBlock {
     fields: HashMap<String, String>,
 }
 
+#[derive(Debug, Clone)]
+pub struct ChannelInfo {
+    pub index: usize,
+    pub name: String,
+    pub direction: String,
+}
+
 fn find_bytes(haystack: &[u8], needle: &[u8]) -> Option<usize> {
     if needle.is_empty() || haystack.len() < needle.len() {
         return None;
@@ -95,9 +102,22 @@ fn parse_sensitivity_name(scale_text: &str) -> Option<String> {
     Some(after[..end].trim().to_string())
 }
 
+// Returns the last parseable f32 token in text, used to extract the full-scale V value
+// from a Z scale string like "V [Sens. Zsens] (0.006176541 V/LSB) 1.988846 V".
+fn parse_last_float(text: &str) -> Option<f32> {
+    text.split_whitespace()
+        .filter_map(|t| {
+            t.trim_matches(|c: char| c == '(' || c == ')' || c == ',')
+                .parse::<f32>()
+                .ok()
+        })
+        .last()
+}
+
 fn parse_nm_per_lsb(
     image_block: &ImageBlock,
     measurement_conditions: &HashMap<String, String>,
+    bytes_per_pixel: usize,
 ) -> Result<f32, String> {
     let z_scale_text = image_block
         .fields
@@ -121,7 +141,16 @@ fn parse_nm_per_lsb(
     let nm_per_v = parse_float_before_unit(sens_value, "nm/V")
         .ok_or_else(|| format!("Could not parse nm/V from sensitivity field {sens_key}: {sens_value}"))?;
 
-    Ok(v_per_lsb * nm_per_v)
+    // Bruker convention: Z scale voltage represents the full peak-to-peak range across all
+    // 256^bpp steps (unsigned integer range). For 16-bit: 65536 steps, so 1 LSB = z_scale_v / 65536.
+    // For trace scans z_scale_v < v_per_lsb * max_int, so min() selects z_scale_v / max_int.
+    // For retrace scans z_scale_v = v_per_lsb * max_int (full hardware range), so both are equal.
+    let z_scale_v = parse_last_float(z_scale_text)
+        .ok_or_else(|| format!("Could not parse full-scale V from Z scale: {z_scale_text}"))?;
+    let max_int = (1u64 << (bytes_per_pixel * 8)) as f32;
+    let effective_v_per_lsb = v_per_lsb.min(z_scale_v / max_int);
+
+    Ok(effective_v_per_lsb * nm_per_v)
 }
 
 fn apply_scale_in_place(image_2d: &mut [Vec<f32>], scale: f32) {
@@ -132,27 +161,83 @@ fn apply_scale_in_place(image_2d: &mut [Vec<f32>], scale: f32) {
     }
 }
 
-fn choose_image_block(image_blocks: &[ImageBlock]) -> Result<&ImageBlock, String> {
-    let has_required_fields = |b: &ImageBlock| {
-        b.fields.contains_key("Data offset")
-            && b.fields.contains_key("Data length")
-            && b.fields.contains_key("Samps/line")
-            && b.fields.contains_key("Number of lines")
-            && b.fields.contains_key("Bytes/pixel")
-    };
+fn has_required_fields(b: &ImageBlock) -> bool {
+    b.fields.contains_key("Data offset")
+        && b.fields.contains_key("Data length")
+        && b.fields.contains_key("Samps/line")
+        && b.fields.contains_key("Number of lines")
+        && b.fields.contains_key("Bytes/pixel")
+}
 
-    if let Some(block) = image_blocks.iter().rfind(|b| {
+fn extract_channel_name(image_data_value: &str) -> String {
+    // Value format: "S [Height] \"Height\"" → extract text between first pair of quotes
+    let parts: Vec<&str> = image_data_value.split('"').collect();
+    if parts.len() >= 2 && !parts[1].is_empty() {
+        parts[1].to_string()
+    } else {
+        image_data_value.to_string()
+    }
+}
+
+fn list_channels_from_blocks(image_blocks: &[ImageBlock]) -> Vec<ChannelInfo> {
+    image_blocks
+        .iter()
+        .enumerate()
+        .filter(|(_, b)| has_required_fields(b))
+        .map(|(i, b)| {
+            let name = b
+                .fields
+                .iter()
+                .find_map(|(k, v)| {
+                    (k.ends_with(":Image Data") || k == "Image Data")
+                        .then(|| extract_channel_name(v))
+                })
+                .unwrap_or_else(|| format!("Channel {i}"));
+            let direction = b
+                .fields
+                .get("Line Direction")
+                .cloned()
+                .unwrap_or_default();
+            ChannelInfo {
+                index: i,
+                name,
+                direction,
+            }
+        })
+        .collect()
+}
+
+fn choose_image_block(
+    image_blocks: &[ImageBlock],
+    channel_idx: Option<usize>,
+) -> Result<(usize, &ImageBlock), String> {
+    // Explicit channel index: use that block directly
+    if let Some(idx) = channel_idx {
+        let block = image_blocks
+            .get(idx)
+            .ok_or_else(|| format!("Channel index {idx} out of range"))?;
+        if !has_required_fields(block) {
+            return Err(format!("Channel {idx} is missing required fields"));
+        }
+        return Ok((idx, block));
+    }
+
+    // Auto: prefer last Height block
+    if let Some((idx, block)) = image_blocks.iter().enumerate().rfind(|(_, b)| {
         let has_height = b.fields.iter().any(|(k, v)| {
             (k.ends_with(":Image Data") || k == "Image Data") && v.contains("Height")
         });
         has_required_fields(b) && has_height
     }) {
-        return Ok(block);
+        return Ok((idx, block));
     }
 
+    // Fallback: first valid block
     image_blocks
         .iter()
-        .find(|b| has_required_fields(b))
+        .enumerate()
+        .find(|(_, b)| has_required_fields(b))
+        .map(|(i, b)| (i, b))
         .ok_or_else(|| "No image block with required fields found".to_string())
 }
 
@@ -387,9 +472,59 @@ pub struct SpmImage {
     pub scan_size_nm: f32,
     pub samps_per_line: usize,
     pub number_of_lines: usize,
+    pub channel_name: String,
+    pub channel_idx: usize,
+    pub available_channels: Vec<ChannelInfo>,
 }
 
-pub fn load_spm(path: &Path, flatten: Option<u32>) -> Result<SpmImage, String> {
+fn apply_gaussian_filter(data: &[f32], width: usize, height: usize, sigma: f32) -> Vec<f32> {
+    if sigma <= 0.0 {
+        return data.to_vec();
+    }
+    let radius = (3.0 * sigma).ceil() as usize;
+    let kernel: Vec<f32> = (0..=2 * radius)
+        .map(|i| {
+            let x = i as f32 - radius as f32;
+            (-x * x / (2.0 * sigma * sigma)).exp()
+        })
+        .collect();
+    let ksum: f32 = kernel.iter().sum();
+    let kernel: Vec<f32> = kernel.iter().map(|&k| k / ksum).collect();
+
+    // Horizontal pass
+    let mut tmp = vec![0.0_f32; width * height];
+    for r in 0..height {
+        for c in 0..width {
+            let mut acc = 0.0_f32;
+            for (ki, &kv) in kernel.iter().enumerate() {
+                let cc = (c + ki).saturating_sub(radius).min(width - 1);
+                acc += data[r * width + cc] * kv;
+            }
+            tmp[r * width + c] = acc;
+        }
+    }
+
+    // Vertical pass
+    let mut out = vec![0.0_f32; width * height];
+    for r in 0..height {
+        for c in 0..width {
+            let mut acc = 0.0_f32;
+            for (ki, &kv) in kernel.iter().enumerate() {
+                let rr = (r + ki).saturating_sub(radius).min(height - 1);
+                acc += tmp[rr * width + c] * kv;
+            }
+            out[r * width + c] = acc;
+        }
+    }
+    out
+}
+
+pub fn load_spm(
+    path: &Path,
+    flatten: Option<u32>,
+    smooth_sigma: f32,
+    channel_idx: Option<usize>,
+) -> Result<SpmImage, String> {
     let bytes = fs::read(path).map_err(|e| format!("Failed to read file: {e}"))?;
 
     let marker = b"\\*File list end";
@@ -399,7 +534,13 @@ pub fn load_spm(path: &Path, flatten: Option<u32>) -> Result<SpmImage, String> {
     let header_text = String::from_utf8_lossy(&bytes[..header_end]);
 
     let (measurement_conditions, image_blocks) = parse_header_and_image_blocks(&header_text);
-    let image_block = choose_image_block(&image_blocks)?;
+    let available_channels = list_channels_from_blocks(&image_blocks);
+    let (loaded_idx, image_block) = choose_image_block(&image_blocks, channel_idx)?;
+    let channel_name = available_channels
+        .iter()
+        .find(|c| c.index == loaded_idx)
+        .map(|c| c.name.clone())
+        .unwrap_or_else(|| format!("Channel {loaded_idx}"));
 
     let data_offset =
         parse_usize_field(image_block.fields.get("Data offset"), "Data offset")?;
@@ -431,7 +572,7 @@ pub fn load_spm(path: &Path, flatten: Option<u32>) -> Result<SpmImage, String> {
         image_block.fields.get("Start context"),
     )?;
 
-    let nm_per_lsb = parse_nm_per_lsb(image_block, &measurement_conditions)?;
+    let nm_per_lsb = parse_nm_per_lsb(image_block, &measurement_conditions, bytes_per_pixel)?;
     apply_scale_in_place(&mut image_2d, nm_per_lsb);
 
     let data = if let Some(order) = flatten {
@@ -439,6 +580,7 @@ pub fn load_spm(path: &Path, flatten: Option<u32>) -> Result<SpmImage, String> {
     } else {
         image_2d.iter().flatten().copied().collect()
     };
+    let data = apply_gaussian_filter(&data, samps_per_line, number_of_lines, smooth_sigma);
 
     let scan_size_nm = parse_scan_size_nm(&measurement_conditions);
 
@@ -448,5 +590,8 @@ pub fn load_spm(path: &Path, flatten: Option<u32>) -> Result<SpmImage, String> {
         scan_size_nm,
         samps_per_line,
         number_of_lines,
+        channel_name,
+        channel_idx: loaded_idx,
+        available_channels,
     })
 }
