@@ -5,23 +5,29 @@ mod colormap;
 mod parser;
 
 fn setup_fonts(ctx: &egui::Context) {
+    #[cfg(target_os = "windows")]
     let font_path = r"C:\Windows\Fonts\NotoSansJP-VF.ttf";
+    #[cfg(target_os = "macos")]
+    let font_path = "/System/Library/Fonts/ヒラギノ角ゴシック W3.ttc";
+    #[cfg(not(any(target_os = "windows", target_os = "macos")))]
+    let font_path = "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc";
+
     if let Ok(bytes) = std::fs::read(font_path) {
         let mut fonts = egui::FontDefinitions::default();
         fonts.font_data.insert(
-            "NotoSansJP".to_owned(),
+            "JapaneseFont".to_owned(),
             std::sync::Arc::new(egui::FontData::from_owned(bytes)),
         );
         fonts
             .families
             .get_mut(&egui::FontFamily::Proportional)
             .unwrap()
-            .insert(1, "NotoSansJP".to_owned());
+            .insert(1, "JapaneseFont".to_owned());
         fonts
             .families
             .get_mut(&egui::FontFamily::Monospace)
             .unwrap()
-            .push("NotoSansJP".to_owned());
+            .push("JapaneseFont".to_owned());
         ctx.set_fonts(fonts);
     }
 }

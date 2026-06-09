@@ -1,0 +1,16 @@
+[tasks.bundle]
+command = "cargo"
+args = ["bundle", "--release"]
+
+[tasks.dmg]
+dependencies = ["bundle"]
+script = '''
+APP="target/release/bundle/osx/Kuntuba AFM Viewer.app"
+OUT="target/release/afm_viewer.dmg"
+create-dmg \
+  --volname "Kuntuba AFM Viewer" \
+  --window-size 500 300 \
+  --app-drop-link 350 150 \
+  "$APP" "$OUT"
+echo "Created: $OUT"
+'''
