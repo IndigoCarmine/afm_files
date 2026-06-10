@@ -519,13 +519,85 @@ fn apply_gaussian_filter(data: &[f32], width: usize, height: usize, sigma: f32) 
     out
 }
 
+/// Read file bytes, handling macOS FileProvider (iCloud / Dropbox / Google Drive)
+/// online-only files that have not yet been downloaded to local storage.
+fn read_file_bytes(path: &Path) -> Result<Vec<u8>, String> {
+    #[cfg(target_os = "macos")]
+    ensure_materialized(path)?;
+
+    fs::read(path).map_err(|e| format!("Failed to read file: {e}"))
+}
+
+/// On macOS, detect online-only files (zero allocated blocks, non-zero size) and
+/// trigger a download via the appropriate provider CLI before attempting to read.
+#[cfg(target_os = "macos")]
+fn ensure_materialized(path: &Path) -> Result<(), String> {
+    use std::os::unix::fs::MetadataExt as _;
+
+    let meta = fs::metadata(path)
+        .map_err(|e| format!("Cannot stat {}: {e}", path.display()))?;
+
+    // File is already local if it has allocated disk blocks.
+    if !(meta.blocks() == 0 && meta.len() > 0) {
+        return Ok(());
+    }
+
+    let path_str = path.to_string_lossy();
+
+    // Method 1: fileproviderctl materialize — Dropbox / Google Drive (macOS ≤ 14.3)
+    if run_silent("fileproviderctl", &["materialize", &path_str]) {
+        if poll_until_local(path, 30) {
+            return Ok(());
+        }
+    }
+
+    // Method 2: brctl download — iCloud Drive (all macOS versions)
+    if run_silent("brctl", &["download", &path_str]) {
+        if poll_until_local(path, 30) {
+            return Ok(());
+        }
+    }
+
+    Err(format!(
+        "ファイルはクラウドストレージ上にのみ存在し、ダウンロードできませんでした。\n\
+         ファイルを手動でダウンロードしてから再度お試しください。\n\
+         (パス: {path_str})"
+    ))
+}
+
+#[cfg(target_os = "macos")]
+fn run_silent(cmd: &str, args: &[&str]) -> bool {
+    use std::process::Stdio;
+    std::process::Command::new(cmd)
+        .args(args)
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false)
+}
+
+#[cfg(target_os = "macos")]
+fn poll_until_local(path: &Path, max_seconds: u64) -> bool {
+    use std::os::unix::fs::MetadataExt as _;
+    let deadline =
+        std::time::Instant::now() + std::time::Duration::from_secs(max_seconds);
+    while std::time::Instant::now() < deadline {
+        std::thread::sleep(std::time::Duration::from_millis(500));
+        if fs::metadata(path).map(|m| m.blocks() > 0).unwrap_or(false) {
+            return true;
+        }
+    }
+    false
+}
+
 pub fn load_spm(
     path: &Path,
     flatten: Option<u32>,
     smooth_sigma: f32,
     channel_idx: Option<usize>,
 ) -> Result<SpmImage, String> {
-    let bytes = fs::read(path).map_err(|e| format!("Failed to read file: {e}"))?;
+    let bytes = read_file_bytes(path)?;
 
     let marker = b"\\*File list end";
     let marker_pos = find_bytes(&bytes, marker)
