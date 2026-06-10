@@ -215,6 +215,9 @@ impl AfmViewerApp {
         self.image = None;
         self.texture = None;
         self.load_error = None;
+
+        #[cfg(target_os = "macos")]
+        crate::parser::prefetch_cloud_files(self.files.clone());
     }
 
     fn show_toolbar(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {

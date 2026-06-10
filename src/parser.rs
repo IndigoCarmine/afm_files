@@ -1,5 +1,4 @@
 use std::collections::HashMap;
-use std::fs;
 use std::path::Path;
 
 #[derive(Debug, Default, Clone)]
@@ -519,76 +518,116 @@ fn apply_gaussian_filter(data: &[f32], width: usize, height: usize, sigma: f32) 
     out
 }
 
-/// Read file bytes, handling macOS FileProvider (iCloud / Dropbox / Google Drive)
-/// online-only files that have not yet been downloaded to local storage.
+/// Read file bytes.
+/// On macOS, uses NSFileCoordinator so that FileProvider-backed files
+/// (iCloud Drive, Dropbox, Google Drive, etc.) are downloaded on demand
+/// before the data is returned.
 fn read_file_bytes(path: &Path) -> Result<Vec<u8>, String> {
     #[cfg(target_os = "macos")]
-    ensure_materialized(path)?;
+    return read_file_bytes_coordinated(path);
 
-    fs::read(path).map_err(|e| format!("Failed to read file: {e}"))
+    #[cfg(not(target_os = "macos"))]
+    std::fs::read(path).map_err(|e| format!("Failed to read file: {e}"))
 }
 
-/// On macOS, detect online-only files (zero allocated blocks, non-zero size) and
-/// trigger a download via the appropriate provider CLI before attempting to read.
+/// Perform a coordinated read via NSFileCoordinator.
+///
+/// The coordinator transparently triggers a FileProvider download when the
+/// file is a cloud placeholder, waiting until the data is available locally
+/// before invoking the accessor block.  This replaces the previous approach
+/// of shelling out to `fileproviderctl`/`brctl` and polling `stat::blocks`.
 #[cfg(target_os = "macos")]
-fn ensure_materialized(path: &Path) -> Result<(), String> {
-    use std::os::unix::fs::MetadataExt as _;
+fn read_file_bytes_coordinated(path: &Path) -> Result<Vec<u8>, String> {
+    use core::ptr::NonNull;
+    use objc2_foundation::{
+        NSError, NSFileCoordinator, NSFileCoordinatorReadingOptions, NSString, NSURL,
+    };
 
-    let meta = fs::metadata(path)
-        .map_err(|e| format!("Cannot stat {}: {e}", path.display()))?;
+    let url = NSURL::fileURLWithPath(&NSString::from_str(&path.to_string_lossy()));
+    let coordinator = NSFileCoordinator::new();
 
-    // File is already local if it has allocated disk blocks.
-    if !(meta.blocks() == 0 && meta.len() > 0) {
-        return Ok(());
+    // The accessor block is called synchronously on the current thread, so a
+    // raw pointer lets us write the result out without a runtime borrow check.
+    let mut result: Option<Result<Vec<u8>, String>> = None;
+    let result_ptr = std::ptr::addr_of_mut!(result);
+
+    let block = block2::StackBlock::new(move |new_url: NonNull<NSURL>| {
+        let r = unsafe {
+            let path_ns = new_url.as_ref().path().expect("coordinated URL has no path");
+            std::fs::read(path_ns.to_string()).map_err(|e| format!("Failed to read file: {e}"))
+        };
+        // SAFETY: NSFileCoordinator calls this block synchronously on the calling
+        // thread; no aliasing of result_ptr occurs during execution.
+        unsafe { *result_ptr = Some(r) };
+    });
+
+    let mut out_error: Option<objc2::rc::Retained<NSError>> = None;
+    coordinator.coordinateReadingItemAtURL_options_error_byAccessor(
+        &url,
+        NSFileCoordinatorReadingOptions(0),
+        Some(&mut out_error),
+        &block,
+    );
+    if let Some(err) = out_error {
+        let desc = err.localizedDescription();
+        return Err(format!("クラウドストレージからの読み込みに失敗しました: {desc}"));
     }
 
-    let path_str = path.to_string_lossy();
-
-    // Method 1: fileproviderctl materialize — Dropbox / Google Drive (macOS ≤ 14.3)
-    if run_silent("fileproviderctl", &["materialize", &path_str]) {
-        if poll_until_local(path, 30) {
-            return Ok(());
-        }
-    }
-
-    // Method 2: brctl download — iCloud Drive (all macOS versions)
-    if run_silent("brctl", &["download", &path_str]) {
-        if poll_until_local(path, 30) {
-            return Ok(());
-        }
-    }
-
-    Err(format!(
-        "ファイルはクラウドストレージ上にのみ存在し、ダウンロードできませんでした。\n\
-         ファイルを手動でダウンロードしてから再度お試しください。\n\
-         (パス: {path_str})"
-    ))
+    result.ok_or_else(|| {
+        format!(
+            "ファイルを開けませんでした。クラウドストレージ上のファイルの場合は\
+             手動でダウンロードしてから再度お試しください。\n(パス: {})",
+            path.display()
+        )
+    })?
 }
 
+/// Kick off background downloads for any cloud-placeholder files in `paths`.
+///
+/// - iCloud Drive: `NSFileManager.startDownloadingUbiquitousItemAtURL` — fires
+///   asynchronously; the OS downloads in the background.
+/// - Other FileProviders (Dropbox, Google Drive, …): `NSFileCoordinator` with
+///   an empty accessor — blocks the background thread until each file is local.
+///
+/// Returns immediately; the work runs on a detached thread.
 #[cfg(target_os = "macos")]
-fn run_silent(cmd: &str, args: &[&str]) -> bool {
-    use std::process::Stdio;
-    std::process::Command::new(cmd)
-        .args(args)
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status()
-        .map(|s| s.success())
-        .unwrap_or(false)
-}
+pub fn prefetch_cloud_files(paths: Vec<std::path::PathBuf>) {
+    std::thread::spawn(move || {
+        use core::ptr::NonNull;
+        use std::os::unix::fs::MetadataExt as _;
+        use objc2_foundation::{
+            NSFileCoordinator, NSFileCoordinatorReadingOptions, NSFileManager, NSString, NSURL,
+        };
 
-#[cfg(target_os = "macos")]
-fn poll_until_local(path: &Path, max_seconds: u64) -> bool {
-    use std::os::unix::fs::MetadataExt as _;
-    let deadline =
-        std::time::Instant::now() + std::time::Duration::from_secs(max_seconds);
-    while std::time::Instant::now() < deadline {
-        std::thread::sleep(std::time::Duration::from_millis(500));
-        if fs::metadata(path).map(|m| m.blocks() > 0).unwrap_or(false) {
-            return true;
+        let fm = NSFileManager::new();
+
+        for path in &paths {
+            let is_placeholder = std::fs::metadata(path)
+                .map(|m| m.blocks() == 0 && m.len() > 0)
+                .unwrap_or(false);
+            if !is_placeholder {
+                continue;
+            }
+
+            let url = NSURL::fileURLWithPath(&NSString::from_str(&path.to_string_lossy()));
+
+            if fm.isUbiquitousItemAtURL(&url) {
+                // iCloud: enqueue download and move on — OS handles the rest.
+                let _ = fm.startDownloadingUbiquitousItemAtURL_error(&url);
+            } else {
+                // Other FileProviders: coordinate a read with an empty accessor to
+                // trigger materialisation; blocks this thread until the file is local.
+                let coordinator = NSFileCoordinator::new();
+                let block = block2::StackBlock::new(|_: NonNull<NSURL>| {});
+                coordinator.coordinateReadingItemAtURL_options_error_byAccessor(
+                    &url,
+                    NSFileCoordinatorReadingOptions(0),
+                    None,
+                    &block,
+                );
+            }
         }
-    }
-    false
+    });
 }
 
 pub fn load_spm(
