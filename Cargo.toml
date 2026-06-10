@@ -1,12 +1,12 @@
 [package]
 name = "afm_files"
-version = "0.2.0"
+version = "0.2.1"
 edition = "2021"
 
 [package.metadata.bundle]
 name = "Kuntuba AFM Viewer"
 identifier = "io.github.indigocarmine.kintuba"
-version = "0.2.0"
+version = "0.2.1"
 
 copyright = "Copyright (c) Yuhei Yamada 2026. All rights reserved."
 
