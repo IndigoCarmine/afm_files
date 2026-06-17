@@ -32,11 +32,24 @@ fn setup_fonts(ctx: &egui::Context) {
     }
 }
 
+fn app_icon() -> egui::IconData {
+    let bytes = include_bytes!("../assets/AppIcon.iconset/icon_256x256.png");
+    let image = image::load_from_memory(bytes).expect("valid icon PNG");
+    let image = image.into_rgba8();
+    let (w, h) = image.dimensions();
+    egui::IconData {
+        rgba: image.into_raw(),
+        width: w,
+        height: h,
+    }
+}
+
 fn main() -> eframe::Result {
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_title("Kintuba AFM Viewer")
-            .with_inner_size([1200.0, 800.0]),
+            .with_inner_size([1200.0, 800.0])
+            .with_icon(std::sync::Arc::new(app_icon())),
         ..Default::default()
     };
     eframe::run_native(
