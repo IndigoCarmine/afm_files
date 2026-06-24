@@ -8,7 +8,15 @@ use std::path::PathBuf;
 #[derive(PartialEq)]
 enum Tab {
     View,
+    HeightAnalysis,
     Analysis,
+}
+
+#[derive(PartialEq, Clone)]
+enum ProfileFilter {
+    None,
+    Gaussian,
+    Custom,
 }
 
 pub struct AfmViewerApp {
@@ -52,6 +60,14 @@ pub struct AfmViewerApp {
     // Profile plot markers (distance in nm)
     plot_marker_a: Option<f64>,
     plot_marker_b: Option<f64>,
+
+    // Image filter (Analysis tab)
+    profile_filter: ProfileFilter,
+    filter_sigma: f32,
+    custom_kernel_str: String,
+    custom_kernel: Vec<f32>,
+    analysis_texture: Option<TextureHandle>,
+    analysis_texture_dirty: bool,
 }
 
 impl Default for AfmViewerApp {
@@ -82,6 +98,12 @@ impl Default for AfmViewerApp {
             status_msg: String::new(),
             plot_marker_a: None,
             plot_marker_b: None,
+            profile_filter: ProfileFilter::None,
+            filter_sigma: 1.0,
+            custom_kernel_str: "1,2,1".to_string(),
+            custom_kernel: vec![1.0, 2.0, 1.0],
+            analysis_texture: None,
+            analysis_texture_dirty: false,
         }
     }
 }
@@ -128,9 +150,113 @@ fn nice_scale(hint: f32) -> f32 {
         .unwrap_or(hint)
 }
 
+fn gaussian_filter_2d(data: &[f32], width: usize, height: usize, sigma: f32) -> Vec<f32> {
+    if sigma <= 0.0 || data.is_empty() {
+        return data.to_vec();
+    }
+    let radius = (3.0 * sigma).ceil() as usize;
+
+    // horizontal pass
+    let mut h = vec![0.0f32; data.len()];
+    for row in 0..height {
+        for col in 0..width {
+            let mut sum = 0.0f32;
+            let mut ws = 0.0f32;
+            for c in col.saturating_sub(radius)..(col + radius + 1).min(width) {
+                let d = (col as f32 - c as f32) / sigma;
+                let w = (-0.5 * d * d).exp();
+                sum += data[row * width + c] * w;
+                ws += w;
+            }
+            h[row * width + col] = sum / ws;
+        }
+    }
+    // vertical pass
+    let mut out = vec![0.0f32; data.len()];
+    for col in 0..width {
+        for row in 0..height {
+            let mut sum = 0.0f32;
+            let mut ws = 0.0f32;
+            for r in row.saturating_sub(radius)..(row + radius + 1).min(height) {
+                let d = (row as f32 - r as f32) / sigma;
+                let w = (-0.5 * d * d).exp();
+                sum += h[r * width + col] * w;
+                ws += w;
+            }
+            out[row * width + col] = sum / ws;
+        }
+    }
+    out
+}
+
+fn custom_kernel_filter_2d(data: &[f32], width: usize, height: usize, kernel: &[f32]) -> Vec<f32> {
+    if kernel.is_empty() || data.is_empty() {
+        return data.to_vec();
+    }
+    let half = kernel.len() / 2;
+
+    let conv1d = |src: &[f32], n: usize, stride: usize, out: &mut [f32]| {
+        for i in 0..n {
+            let mut sum = 0.0f32;
+            let mut ws = 0.0f32;
+            for (ki, &kv) in kernel.iter().enumerate() {
+                let s = i as isize + ki as isize - half as isize;
+                if s >= 0 && s < n as isize {
+                    sum += src[s as usize * stride] * kv;
+                    ws += kv;
+                }
+            }
+            out[i * stride] = if ws.abs() > f32::EPSILON { sum / ws } else { src[i * stride] };
+        }
+    };
+
+    // horizontal pass (stride = 1, n = width, repeat for each row)
+    let mut h = data.to_vec();
+    for row in 0..height {
+        let base = row * width;
+        let src: Vec<f32> = (0..width).map(|c| data[base + c]).collect();
+        conv1d(&src, width, 1, &mut h[base..]);
+    }
+    // vertical pass (stride = width, n = height, repeat for each col)
+    let mut out = h.clone();
+    for col in 0..width {
+        let src: Vec<f32> = (0..height).map(|r| h[r * width + col]).collect();
+        let mut tmp = vec![0.0f32; height];
+        conv1d(&src, height, 1, &mut tmp);
+        for r in 0..height {
+            out[r * width + col] = tmp[r];
+        }
+    }
+    out
+}
+
 // ── impl ──────────────────────────────────────────────────────────────────────
 
 impl AfmViewerApp {
+    fn rebuild_analysis_texture(&mut self, ctx: &egui::Context) {
+        if let Some(ref img) = self.image {
+            let filtered = match self.profile_filter {
+                ProfileFilter::None => img.data.clone(),
+                ProfileFilter::Gaussian => {
+                    gaussian_filter_2d(&img.data, img.samps_per_line, img.number_of_lines, self.filter_sigma)
+                }
+                ProfileFilter::Custom => {
+                    custom_kernel_filter_2d(&img.data, img.samps_per_line, img.number_of_lines, &self.custom_kernel)
+                }
+            };
+            let ci = to_color_image(
+                &filtered,
+                img.number_of_lines,
+                img.samps_per_line,
+                self.colormap,
+                self.z_min,
+                self.z_max,
+            );
+            self.analysis_texture = Some(ctx.load_texture("analysis_image", ci, TextureOptions::NEAREST));
+        }
+        self.analysis_texture_dirty = false;
+    }
+
     fn load_file(&mut self, ctx: &egui::Context, idx: usize) {
         self.load_file_channel(ctx, idx, None);
     }
@@ -153,6 +279,8 @@ impl AfmViewerApp {
         self.plot_marker_b = None;
         self.zoom = 1.0;
         self.pan = Vec2::ZERO;
+        self.analysis_texture = None;
+        self.analysis_texture_dirty = true;
 
         // For new files, auto-detect channel; for reloads use current channel
         let channel = if let Some(ch) = channel_override {
@@ -476,6 +604,9 @@ impl AfmViewerApp {
             );
         }
 
+        // Border around image area
+        painter.rect_stroke(rect, 0.0, egui::Stroke::new(1.0, egui::Color32::BLACK), egui::StrokeKind::Inside);
+
         // Scale bar
         if let Some(ref img) = self.image {
             let bar_nm = nice_scale(img.scan_size_nm / 5.0);
@@ -500,7 +631,7 @@ impl AfmViewerApp {
         }
     }
 
-    // ── Analysis tab ──────────────────────────────────────────────────────────
+    // ── Height Analysis tab ───────────────────────────────────────────────────
 
     fn show_analysis_tab(&mut self, ui: &mut egui::Ui, _ctx: &egui::Context) {
         if self.texture.is_none() || self.image.is_none() {
@@ -562,6 +693,9 @@ impl AfmViewerApp {
                     egui::Color32::WHITE,
                 );
             }
+
+            // Border around image area
+            painter.rect_stroke(rect, 0.0, egui::Stroke::new(1.0, egui::Color32::from_gray(100)), egui::StrokeKind::Outside);
 
             // ── handle drag start ────────────────────────────────────────────
             const HANDLE_R: f32 = 7.0;
@@ -866,6 +1000,161 @@ impl AfmViewerApp {
             });
         });
     }
+
+    // ── Analysis (Image Filter) tab ───────────────────────────────────────────
+
+    fn show_filter_tab(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
+        if self.image.is_none() {
+            ui.label("Select a file first.");
+            return;
+        }
+
+        // ── filter controls ──────────────────────────────────────────────────
+        let mut dirty = self.analysis_texture_dirty;
+
+        ui.horizontal(|ui| {
+            ui.label("Filter:");
+            let prev = self.profile_filter.clone();
+            egui::ComboBox::from_id_salt("img_filter")
+                .selected_text(match self.profile_filter {
+                    ProfileFilter::None => "None",
+                    ProfileFilter::Gaussian => "Gaussian",
+                    ProfileFilter::Custom => "Custom",
+                })
+                .show_ui(ui, |ui| {
+                    ui.selectable_value(&mut self.profile_filter, ProfileFilter::None, "None");
+                    ui.selectable_value(&mut self.profile_filter, ProfileFilter::Gaussian, "Gaussian");
+                    ui.selectable_value(&mut self.profile_filter, ProfileFilter::Custom, "Custom");
+                });
+            if self.profile_filter != prev {
+                dirty = true;
+            }
+
+            match self.profile_filter {
+                ProfileFilter::Gaussian => {
+                    ui.label("σ:");
+                    let prev_sigma = self.filter_sigma;
+                    ui.add(
+                        egui::DragValue::new(&mut self.filter_sigma)
+                            .speed(0.1)
+                            .range(0.1..=50.0)
+                            .suffix(" px"),
+                    );
+                    if (self.filter_sigma - prev_sigma).abs() > f32::EPSILON {
+                        dirty = true;
+                    }
+                }
+                ProfileFilter::Custom => {
+                    ui.label("Kernel (separable 1D):");
+                    ui.add(
+                        egui::TextEdit::singleline(&mut self.custom_kernel_str).desired_width(160.0),
+                    );
+                    if ui.button("Apply").clicked() {
+                        self.custom_kernel = self.custom_kernel_str
+                            .split(',')
+                            .filter_map(|s| s.trim().parse::<f32>().ok())
+                            .collect();
+                        dirty = true;
+                    }
+                }
+                ProfileFilter::None => {}
+            }
+
+            if ui.button("💾 Save Image").clicked() {
+                if let (Some(ref img), Some(ref tex)) = (&self.image, &self.analysis_texture) {
+                    let _ = tex; // texture already built; re-derive filtered data for export
+                    let filtered = match self.profile_filter {
+                        ProfileFilter::None => img.data.clone(),
+                        ProfileFilter::Gaussian => gaussian_filter_2d(
+                            &img.data, img.samps_per_line, img.number_of_lines, self.filter_sigma,
+                        ),
+                        ProfileFilter::Custom => custom_kernel_filter_2d(
+                            &img.data, img.samps_per_line, img.number_of_lines, &self.custom_kernel,
+                        ),
+                    };
+                    if let Some(path) = rfd::FileDialog::new().add_filter("PNG", &["png"]).save_file() {
+                        match export_afm_image(
+                            &filtered,
+                            img.number_of_lines,
+                            img.samps_per_line,
+                            self.colormap,
+                            self.z_min,
+                            self.z_max,
+                            &path,
+                        ) {
+                            Ok(_) => self.status_msg = "Image saved.".to_string(),
+                            Err(e) => self.status_msg = format!("Save error: {e}"),
+                        }
+                    }
+                }
+            }
+
+            if !self.status_msg.is_empty() {
+                ui.label(&self.status_msg.clone());
+            }
+        });
+
+        // rebuild texture when dirty
+        if dirty {
+            self.rebuild_analysis_texture(ctx);
+        }
+
+        ui.separator();
+
+        // ── filtered image display ────────────────────────────────────────────
+        let avail = ui.available_size();
+        let side = avail.x.min(avail.y) - 20.0;
+
+        let (response, painter) =
+            ui.allocate_painter(Vec2::new(side, side), egui::Sense::click_and_drag());
+        let rect = response.rect;
+
+        if response.dragged() {
+            self.pan += response.drag_delta();
+        }
+        let scroll = ctx.input(|i| i.smooth_scroll_delta.y);
+        if scroll != 0.0 && response.hovered() {
+            let factor = (1.0 + scroll * 0.001).clamp(0.8, 1.25);
+            if let Some(cursor) = ctx.input(|i| i.pointer.hover_pos()) {
+                let before = cursor - rect.center().to_vec2() - self.pan;
+                self.zoom = (self.zoom * factor).clamp(0.1, 50.0);
+                self.pan = cursor - rect.center().to_vec2() - before * factor;
+            } else {
+                self.zoom = (self.zoom * factor).clamp(0.1, 50.0);
+            }
+        }
+
+        if let Some(ref tex) = self.analysis_texture {
+            let origin = image_origin(rect, self.zoom, self.pan);
+            let size = rect.size() * self.zoom;
+            painter.image(
+                tex.id(),
+                egui::Rect::from_min_size(origin, size),
+                egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
+                egui::Color32::WHITE,
+            );
+        }
+
+        painter.rect_stroke(rect, 0.0, egui::Stroke::new(5.0, egui::Color32::BLACK), egui::StrokeKind::Inside);
+
+        if let Some(ref img) = self.image {
+            let bar_nm = nice_scale(img.scan_size_nm / 5.0);
+            let bar_px = (bar_nm / img.scan_size_nm) * rect.width() * self.zoom;
+            let bar_y = rect.max.y - 12.0;
+            let bar_x0 = rect.min.x + 10.0;
+            painter.line_segment(
+                [egui::pos2(bar_x0, bar_y), egui::pos2(bar_x0 + bar_px, bar_y)],
+                egui::Stroke::new(3.0, egui::Color32::WHITE),
+            );
+            painter.text(
+                egui::pos2(bar_x0 + bar_px + 4.0, bar_y),
+                egui::Align2::LEFT_CENTER,
+                format!("{bar_nm:.0} nm"),
+                egui::FontId::proportional(12.0),
+                egui::Color32::WHITE,
+            );
+        }
+    }
 }
 
 impl eframe::App for AfmViewerApp {
@@ -894,6 +1183,12 @@ impl eframe::App for AfmViewerApp {
                     self.tab = Tab::View;
                 }
                 if ui
+                    .selectable_label(self.tab == Tab::HeightAnalysis, "Height Analysis")
+                    .clicked()
+                {
+                    self.tab = Tab::HeightAnalysis;
+                }
+                if ui
                     .selectable_label(self.tab == Tab::Analysis, "Analysis")
                     .clicked()
                 {
@@ -904,7 +1199,8 @@ impl eframe::App for AfmViewerApp {
 
             match self.tab {
                 Tab::View => self.show_view_tab(ui, ctx),
-                Tab::Analysis => self.show_analysis_tab(ui, ctx),
+                Tab::HeightAnalysis => self.show_analysis_tab(ui, ctx),
+                Tab::Analysis => self.show_filter_tab(ui, ctx),
             }
         });
     }
