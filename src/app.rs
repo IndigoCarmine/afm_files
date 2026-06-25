@@ -81,6 +81,10 @@ pub struct AfmViewerApp {
     // Cheap signature of the inputs the mesh depends on; when it changes the
     // mesh is rebuilt. (z values stored as bits to keep the key Copy + Eq.)
     mesh_key: Option<(u64, Colormap, u32, u32, u32)>,
+    // 3D image export: a requested save path is consumed by the paint callback
+    // (where the GL context is current); the outcome is reported back here.
+    export_request: Option<PathBuf>,
+    export_status: Arc<Mutex<Option<String>>>,
 }
 
 impl Default for AfmViewerApp {
@@ -123,6 +127,8 @@ impl Default for AfmViewerApp {
             z_exaggeration: 0.6,
             image_gen: 0,
             mesh_key: None,
+            export_request: None,
+            export_status: Arc::new(Mutex::new(None)),
         }
     }
 }
@@ -1186,13 +1192,33 @@ impl AfmViewerApp {
     }
 
     fn show_view3d_tab(&mut self, ui: &mut egui::Ui) {
+        // Surface the result of a previous frame's export: the save runs in the
+        // paint callback, so its outcome is reported back a frame later.
+        if let Some(msg) = self.export_status.lock().unwrap().take() {
+            self.status_msg = msg;
+        }
+
         ui.horizontal(|ui| {
             ui.label("Z exaggeration:");
             ui.add(egui::Slider::new(&mut self.z_exaggeration, 0.05..=3.0).logarithmic(true));
             if ui.button("Reset view").clicked() {
                 self.camera = OrbitalCamera::default();
             }
-            ui.label("   Drag: orbit · Right-drag / Shift-drag: pan · Scroll: zoom");
+            if ui.button("💾 Save Image").clicked() && self.image.is_some() {
+                if let Some(path) = rfd::FileDialog::new()
+                    .add_filter("PNG", &["png"])
+                    .save_file()
+                {
+                    self.export_request = Some(path);
+                }
+            }
+        });
+        ui.horizontal(|ui| {
+            ui.label("Drag: orbit · Right-drag / Shift-drag: pan · Scroll: zoom");
+            if !self.status_msg.is_empty() {
+                ui.separator();
+                ui.label(&self.status_msg);
+            }
         });
         ui.separator();
 
@@ -1265,7 +1291,30 @@ impl AfmViewerApp {
         let aspect = rect.width() / rect.height().max(1.0);
         let mvp = self.camera.view_proj(aspect);
         let light_dir = glam::Vec3::new(0.4, 1.0, 0.6);
+
+        // A pending save is rendered off-screen inside the callback (where the
+        // GL context is current). Export at ~1200 px tall, preserving the
+        // on-screen aspect so the saved framing matches what's displayed.
+        let export = self.export_request.take();
+        let export_status = self.export_status.clone();
+        let export_ctx = ui.ctx().clone();
+        let export_h = 1200i32;
+        let export_w = ((export_h as f32 * aspect).round() as i32).max(16);
+
         let cb = egui_glow::CallbackFn::new(move |info, painter| {
+            let gl = painter.gl();
+            let mut r = renderer.lock().unwrap();
+            if let Some(path) = export.as_ref() {
+                let msg = match r.render_to_image(gl, &mvp, light_dir, export_w, export_h) {
+                    Ok(img) => match img.save(path) {
+                        Ok(()) => format!("3D image saved: {}", path.display()),
+                        Err(e) => format!("Save error: {e}"),
+                    },
+                    Err(e) => format!("Export error: {e}"),
+                };
+                *export_status.lock().unwrap() = Some(msg);
+                export_ctx.request_repaint();
+            }
             let vp = info.viewport_in_pixels();
             let viewport = [
                 vp.left_px as i32,
@@ -1273,10 +1322,7 @@ impl AfmViewerApp {
                 vp.width_px as i32,
                 vp.height_px as i32,
             ];
-            renderer
-                .lock()
-                .unwrap()
-                .paint(painter.gl(), &mvp, light_dir, viewport);
+            r.paint(gl, &mvp, light_dir, viewport);
         });
         ui.painter().add(egui::PaintCallback {
             rect,

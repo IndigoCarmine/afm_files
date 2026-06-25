@@ -1,12 +1,16 @@
 //! 3D height-map surface view: an orbital camera plus a glow (OpenGL) renderer
 //! that draws the AFM height field as a lit, colormap-shaded triangle mesh.
 //!
-//! The camera follows the design used in `moleucle_3dview_rs`: orientation is a
-//! quaternion, the eye orbits a `center` at a fixed `radius`, the view matrix is
-//! built directly from the inverse rotation and an eye translation, panning
-//! moves the center along the camera-local axes scaled by `radius`, and dollying
-//! adjusts `radius`. The projection is the OpenGL right-handed perspective
-//! (clip-space z in [-1, 1]) to match the glow backend.
+//! The camera follows the design used in `moleucle_3dview_rs`: the eye orbits a
+//! `center` at a fixed `radius`, the view matrix is built from the inverse
+//! rotation and an eye translation, panning moves the center along the
+//! camera-local axes scaled by `radius`, and dollying adjusts `radius`. The
+//! projection is the OpenGL right-handed perspective (clip-space z in [-1, 1])
+//! to match the glow backend.
+//!
+//! Orientation is a *turntable*: yaw (about world up) and pitch (elevation) are
+//! kept as separate angles and the rotation is rebuilt from them each frame, so
+//! the camera never rolls about its own view axis.
 
 use crate::colormap::Colormap;
 use crate::parser::SpmImage;
@@ -20,11 +24,15 @@ const ZOOM_SPEED: f32 = 0.0015;
 const MIN_RADIUS: f32 = 0.1;
 const MAX_RADIUS: f32 = 50.0;
 
-/// Orbital (turntable) camera. `rotation` is the single source of truth for
-/// orientation; the eye position is derived from `center`, `rotation`, `radius`.
+/// Orbital turntable camera. Orientation is stored as `yaw`/`pitch` angles (not
+/// a free quaternion) so accumulated drags can never introduce roll about the
+/// view axis; the rotation is reconstructed from them on demand.
 pub struct OrbitalCamera {
     pub center: Vec3,
-    pub rotation: Quat,
+    /// Azimuth about world up (Y), radians.
+    pub yaw: f32,
+    /// Elevation, radians, clamped to keep the camera from flipping over.
+    pub pitch: f32,
     pub radius: f32,
     pub fov_y: f32,
     pub near: f32,
@@ -35,9 +43,9 @@ impl Default for OrbitalCamera {
     fn default() -> Self {
         Self {
             center: Vec3::ZERO,
-            // A pleasant 3/4 bird's-eye angle: yaw ~30°, pitch down ~30°.
-            rotation: Quat::from_axis_angle(Vec3::X, -30f32.to_radians())
-                * Quat::from_axis_angle(Vec3::Y, -30f32.to_radians()),
+            // A pleasant 3/4 bird's-eye angle.
+            yaw: -30f32.to_radians(),
+            pitch: -30f32.to_radians(),
             radius: 3.5,
             fov_y: 45f32.to_radians(),
             near: 0.01,
@@ -47,15 +55,22 @@ impl Default for OrbitalCamera {
 }
 
 impl OrbitalCamera {
+    /// Rotation reconstructed from yaw/pitch: yaw about world up, then pitch
+    /// about the (yawed) right axis. Because `right` stays in the world XZ plane,
+    /// the camera has no roll component.
+    fn rotation(&self) -> Quat {
+        Quat::from_axis_angle(Vec3::Y, self.yaw) * Quat::from_axis_angle(Vec3::X, self.pitch)
+    }
+
     /// World-space camera-local axes derived from the current rotation.
     fn forward(&self) -> Vec3 {
-        self.rotation * Vec3::NEG_Z
+        self.rotation() * Vec3::NEG_Z
     }
     fn right(&self) -> Vec3 {
-        self.rotation * Vec3::X
+        self.rotation() * Vec3::X
     }
     fn up(&self) -> Vec3 {
-        self.rotation * Vec3::Y
+        self.rotation() * Vec3::Y
     }
 
     /// Eye position: `center - rotated_forward * radius`.
@@ -63,10 +78,9 @@ impl OrbitalCamera {
         self.center - self.forward() * self.radius
     }
 
-    /// World→view matrix, built as `inverse(rotation) * translate(-eye)` (no
-    /// `look_at`, so it stays well-defined even looking straight down).
+    /// World→view matrix, built as `inverse(rotation) * translate(-eye)`.
     pub fn view_matrix(&self) -> Mat4 {
-        Mat4::from_quat(self.rotation.inverse()) * Mat4::from_translation(-self.eye())
+        Mat4::from_quat(self.rotation().inverse()) * Mat4::from_translation(-self.eye())
     }
 
     pub fn proj_matrix(&self, aspect: f32) -> Mat4 {
@@ -77,12 +91,12 @@ impl OrbitalCamera {
         self.proj_matrix(aspect) * self.view_matrix()
     }
 
-    /// Orbit around `center`: yaw about world up, pitch about the camera's right
-    /// axis, accumulated into the rotation quaternion.
+    /// Orbit around `center` by updating the yaw/pitch angles. Pitch is clamped
+    /// just short of the poles so the camera never flips (and never rolls).
     pub fn orbit(&mut self, delta: Vec2) {
-        let yaw = Quat::from_axis_angle(Vec3::Y, -delta.x * ORBIT_SPEED);
-        let pitch = Quat::from_axis_angle(self.right(), -delta.y * ORBIT_SPEED);
-        self.rotation = (yaw * pitch * self.rotation).normalize();
+        self.yaw -= delta.x * ORBIT_SPEED;
+        let limit = 89f32.to_radians();
+        self.pitch = (self.pitch - delta.y * ORBIT_SPEED).clamp(-limit, limit);
     }
 
     /// Pan by sliding `center` along the camera-local right/up axes, scaled by
@@ -238,6 +252,127 @@ impl SurfaceRenderer {
             gl.bind_vertex_array(None);
             gl.use_program(None);
             gl.disable(glow::DEPTH_TEST);
+        }
+    }
+
+    /// Render the surface to an off-screen framebuffer at `width`×`height` and
+    /// return it as a top-down RGBA image (for "Save image"). The previously
+    /// bound framebuffer is restored, so on-screen drawing in the same frame is
+    /// unaffected.
+    pub fn render_to_image(
+        &mut self,
+        gl: &glow::Context,
+        mvp: &Mat4,
+        light_dir: Vec3,
+        width: i32,
+        height: i32,
+    ) -> Result<image::RgbaImage, String> {
+        if width < 1 || height < 1 {
+            return Err("Invalid export size".to_string());
+        }
+        unsafe {
+            if let Some((verts, indices)) = self.pending.take() {
+                self.upload(gl, &verts, &indices);
+            }
+            if self.index_count == 0 {
+                return Err("No surface to export".to_string());
+            }
+
+            let prev_fbo = gl.get_parameter_i32(glow::FRAMEBUFFER_BINDING);
+
+            // Off-screen color texture + depth renderbuffer + framebuffer.
+            let color = gl.create_texture()?;
+            gl.bind_texture(glow::TEXTURE_2D, Some(color));
+            gl.tex_image_2d(
+                glow::TEXTURE_2D,
+                0,
+                glow::RGBA8 as i32,
+                width,
+                height,
+                0,
+                glow::RGBA,
+                glow::UNSIGNED_BYTE,
+                glow::PixelUnpackData::Slice(None),
+            );
+            gl.tex_parameter_i32(glow::TEXTURE_2D, glow::TEXTURE_MIN_FILTER, glow::NEAREST as i32);
+            gl.tex_parameter_i32(glow::TEXTURE_2D, glow::TEXTURE_MAG_FILTER, glow::NEAREST as i32);
+            gl.bind_texture(glow::TEXTURE_2D, None);
+
+            let depth = gl.create_renderbuffer()?;
+            gl.bind_renderbuffer(glow::RENDERBUFFER, Some(depth));
+            gl.renderbuffer_storage(glow::RENDERBUFFER, glow::DEPTH_COMPONENT24, width, height);
+            gl.bind_renderbuffer(glow::RENDERBUFFER, None);
+
+            let fbo = gl.create_framebuffer()?;
+            gl.bind_framebuffer(glow::FRAMEBUFFER, Some(fbo));
+            gl.framebuffer_texture_2d(
+                glow::FRAMEBUFFER,
+                glow::COLOR_ATTACHMENT0,
+                glow::TEXTURE_2D,
+                Some(color),
+                0,
+            );
+            gl.framebuffer_renderbuffer(
+                glow::FRAMEBUFFER,
+                glow::DEPTH_ATTACHMENT,
+                glow::RENDERBUFFER,
+                Some(depth),
+            );
+
+            let status = gl.check_framebuffer_status(glow::FRAMEBUFFER);
+            let result = if status != glow::FRAMEBUFFER_COMPLETE {
+                Err(format!("Framebuffer incomplete: 0x{status:X}"))
+            } else {
+                gl.viewport(0, 0, width, height);
+                gl.enable(glow::DEPTH_TEST);
+                gl.depth_func(glow::LESS);
+                gl.disable(glow::CULL_FACE);
+                gl.clear_color(0.0, 0.0, 0.0, 1.0); // black background, like AFM 3D plots
+                gl.clear_depth_f32(1.0);
+                gl.clear(glow::COLOR_BUFFER_BIT | glow::DEPTH_BUFFER_BIT);
+
+                gl.use_program(Some(self.program));
+                gl.uniform_matrix_4_f32_slice(self.u_mvp.as_ref(), false, &mvp.to_cols_array());
+                gl.uniform_3_f32(
+                    self.u_light_dir.as_ref(),
+                    light_dir.x,
+                    light_dir.y,
+                    light_dir.z,
+                );
+                gl.bind_vertex_array(Some(self.vao));
+                gl.draw_elements(glow::TRIANGLES, self.index_count, glow::UNSIGNED_INT, 0);
+                gl.bind_vertex_array(None);
+                gl.use_program(None);
+                gl.disable(glow::DEPTH_TEST);
+
+                let mut buf = vec![0u8; (width as usize) * (height as usize) * 4];
+                gl.read_pixels(
+                    0,
+                    0,
+                    width,
+                    height,
+                    glow::RGBA,
+                    glow::UNSIGNED_BYTE,
+                    glow::PixelPackData::Slice(Some(&mut buf)),
+                );
+                Ok(buf)
+            };
+
+            // Tear down off-screen objects and restore the prior framebuffer.
+            gl.bind_framebuffer(
+                glow::FRAMEBUFFER,
+                std::num::NonZeroU32::new(prev_fbo as u32).map(glow::NativeFramebuffer),
+            );
+            gl.delete_framebuffer(fbo);
+            gl.delete_texture(color);
+            gl.delete_renderbuffer(depth);
+
+            let buf = result?;
+            let mut img = image::RgbaImage::from_raw(width as u32, height as u32, buf)
+                .ok_or_else(|| "Failed to build image buffer".to_string())?;
+            // GL reads bottom-up; flip to top-down for the saved file.
+            image::imageops::flip_vertical_in_place(&mut img);
+            Ok(img)
         }
     }
 
@@ -433,8 +568,19 @@ mod tests {
     #[test]
     fn camera_orbit_changes_orientation() {
         let mut cam = OrbitalCamera::default();
-        let before = cam.rotation;
+        let before = cam.rotation();
         cam.orbit(egui::Vec2::new(50.0, 0.0));
-        assert!(cam.rotation.angle_between(before) > 1e-3);
+        assert!(cam.rotation().angle_between(before) > 1e-3);
+    }
+
+    #[test]
+    fn camera_never_rolls() {
+        // After arbitrary orbiting, the camera's right axis must stay horizontal
+        // (zero world-Y component) — i.e. no roll about the view axis.
+        let mut cam = OrbitalCamera::default();
+        for _ in 0..50 {
+            cam.orbit(egui::Vec2::new(37.0, -21.0));
+        }
+        assert!(cam.right().y.abs() < 1e-4, "right axis tilted: {}", cam.right().y);
     }
 }
