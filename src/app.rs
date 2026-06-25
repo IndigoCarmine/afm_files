@@ -1,4 +1,4 @@
-use crate::analysis::{export_afm_image, export_csv, export_profile_png, line_profile};
+use crate::analysis::{export_afm_image, export_csv, export_profile_png, line_profile, nice_scale};
 use crate::colormap::{to_color_image, to_rgba_bytes, Colormap};
 use crate::parser::{load_spm, ChannelInfo, SpmImage};
 use crate::view3d::{OrbitalCamera, SurfaceRenderer};
@@ -45,6 +45,9 @@ pub struct AfmViewerApp {
     z_max: f32,
     z_data_min: f32,
     z_data_max: f32,
+
+    // Export options
+    show_scale_bar: bool,
 
     // Tab
     tab: Tab,
@@ -105,6 +108,7 @@ impl Default for AfmViewerApp {
             z_max: 1.0,
             z_data_min: 0.0,
             z_data_max: 1.0,
+            show_scale_bar: true,
             tab: Tab::View,
             zoom: 1.0,
             pan: Vec2::ZERO,
@@ -173,16 +177,6 @@ fn is_spm_file(path: &std::path::Path) -> bool {
         Some(e) => e.chars().all(|c| c.is_ascii_digit()),
         None => false,
     }
-}
-
-fn nice_scale(hint: f32) -> f32 {
-    let nice = [
-        1.0_f32, 2.0, 5.0, 10.0, 20.0, 50.0, 100.0, 200.0, 500.0, 1000.0,
-    ];
-    nice.iter()
-        .copied()
-        .min_by_key(|&v| ((v - hint).abs() * 1000.0) as i64)
-        .unwrap_or(hint)
 }
 
 fn gaussian_filter_2d(data: &[f32], width: usize, height: usize, sigma: f32) -> Vec<f32> {
@@ -546,6 +540,7 @@ impl AfmViewerApp {
         }
 
         ui.horizontal(|ui| {
+            ui.checkbox(&mut self.show_scale_bar, "Scale bar");
             if ui.button("💾 Save Image").clicked() {
                 if let Some(ref img) = self.image {
                     if let Some(path) = rfd::FileDialog::new()
@@ -559,6 +554,8 @@ impl AfmViewerApp {
                             self.colormap,
                             self.z_min,
                             self.z_max,
+                            img.scan_size_nm,
+                            self.show_scale_bar,
                             &path,
                         ) {
                             Ok(_) => self.status_msg = "Image saved.".to_string(),
@@ -1095,6 +1092,7 @@ impl AfmViewerApp {
                 ProfileFilter::None => {}
             }
 
+            ui.checkbox(&mut self.show_scale_bar, "Scale bar");
             if ui.button("💾 Save Image").clicked() {
                 if let (Some(ref img), Some(ref tex)) = (&self.image, &self.analysis_texture) {
                     let _ = tex; // texture already built; re-derive filtered data for export
@@ -1115,6 +1113,8 @@ impl AfmViewerApp {
                             self.colormap,
                             self.z_min,
                             self.z_max,
+                            img.scan_size_nm,
+                            self.show_scale_bar,
                             &path,
                         ) {
                             Ok(_) => self.status_msg = "Image saved.".to_string(),

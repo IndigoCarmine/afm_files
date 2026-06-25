@@ -1,6 +1,7 @@
 use crate::colormap::{to_rgba_bytes, Colormap};
 use crate::parser::SpmImage;
-use image::{ImageBuffer, Rgb};
+use ab_glyph::{point, Font, FontVec, PxScale, ScaleFont};
+use image::{ImageBuffer, Rgb, Rgba, RgbaImage};
 use std::path::Path;
 
 /// Compute a line profile between two pixel-space points (fractional, 0..1).
@@ -48,13 +49,200 @@ pub fn export_afm_image(
     cmap: Colormap,
     z_min: f32,
     z_max: f32,
+    scan_size_nm: f32,
+    scale_bar: bool,
     path: &Path,
 ) -> Result<(), String> {
     let rgba = to_rgba_bytes(data, rows, cols, cmap, z_min, z_max);
-    let img: image::ImageBuffer<image::Rgba<u8>, _> =
-        image::ImageBuffer::from_raw(cols as u32, rows as u32, rgba)
-            .ok_or_else(|| "Failed to create image buffer".to_string())?;
-    img.save(path).map_err(|e| format!("Failed to save image: {e}"))
+    let mut img: RgbaImage = ImageBuffer::from_raw(cols as u32, rows as u32, rgba)
+        .ok_or_else(|| "Failed to create image buffer".to_string())?;
+    if scale_bar {
+        draw_scale_bar(&mut img, scan_size_nm);
+    }
+    img.save(path)
+        .map_err(|e| format!("Failed to save image: {e}"))
+}
+
+/// Snap a length hint (nm) to a "nice" 1-2-5 value, covering 1 nm … 100 µm.
+pub fn nice_scale(hint: f32) -> f32 {
+    let nice = [
+        1.0_f32, 2.0, 5.0, 10.0, 20.0, 50.0, 100.0, 200.0, 500.0, 1000.0, 2000.0, 5000.0, 10000.0,
+        20000.0, 50000.0, 100000.0,
+    ];
+    nice.iter()
+        .copied()
+        .min_by_key(|&v| ((v - hint).abs() * 1000.0) as i64)
+        .unwrap_or(hint)
+}
+
+/// Burn a scale bar (~1/5 of the image width, snapped to a nice value) plus a
+/// "<n> nm" label into the bottom-left of the image. Everything is drawn at the
+/// image's native resolution, so the export is independent of any on-screen zoom.
+fn draw_scale_bar(img: &mut RgbaImage, scan_size_nm: f32) {
+    let (w, h) = (img.width(), img.height());
+    if w < 16 || h < 16 || scan_size_nm <= 0.0 {
+        return;
+    }
+
+    let bar_nm = nice_scale(scan_size_nm / 5.0);
+    let bar_px = (((bar_nm / scan_size_nm) * w as f32).round() as u32).clamp(1, w - 1);
+
+    // Sizes scale with the image so the bar and label stay legible at any res.
+    let s = (h / 100).max(2);
+    let bar_h = (h / 120).max(3);
+    let pad = s;
+    let gap = s;
+    let margin = 4 * s;
+    let label = format!("{} nm", bar_nm as i32);
+
+    // Prefer Arial for the label; fall back to the built-in bitmap font.
+    let font = load_label_font();
+    let px = (h as f32 * 0.06).max(11.0);
+    let (text_w, text_h) = match &font {
+        Some(f) => (measure_text_ttf(&label, px, f).ceil() as u32, px.ceil() as u32),
+        None => (text_width(&label, s), 7 * s),
+    };
+
+    let bar_x = margin;
+    let bar_y = h.saturating_sub(margin + bar_h);
+    let text_x = bar_x;
+    let text_y = bar_y.saturating_sub(text_h + gap);
+
+    // Darkened panel behind the group → readable on any colormap.
+    let panel_x = bar_x.saturating_sub(pad);
+    let panel_y = text_y.saturating_sub(pad);
+    let panel_w = bar_px.max(text_w) + 2 * pad;
+    let panel_h = (bar_y + bar_h).saturating_sub(text_y) + 2 * pad;
+    darken_rect(img, panel_x, panel_y, panel_w, panel_h, 0.45);
+
+    let white = Rgba([255u8, 255, 255, 255]);
+    fill_rect(img, bar_x, bar_y, bar_px, bar_h, white);
+    match &font {
+        Some(f) => draw_text_ttf(img, text_x, text_y, &label, px, f),
+        None => draw_text(img, text_x, text_y, &label, s, white),
+    }
+}
+
+/// Load Arial for the exported label, trying the usual Windows/macOS locations.
+/// Returns `None` if unavailable (callers then fall back to the bitmap font).
+fn load_label_font() -> Option<FontVec> {
+    const CANDIDATES: &[&str] = &[
+        r"C:\Windows\Fonts\arial.ttf",
+        "/Library/Fonts/Arial.ttf",
+        "/System/Library/Fonts/Supplemental/Arial.ttf",
+    ];
+    for path in CANDIDATES {
+        if let Ok(bytes) = std::fs::read(path) {
+            if let Ok(font) = FontVec::try_from_vec(bytes) {
+                return Some(font);
+            }
+        }
+    }
+    None
+}
+
+fn measure_text_ttf(text: &str, px: f32, font: &FontVec) -> f32 {
+    let sf = font.as_scaled(PxScale::from(px));
+    text.chars().map(|c| sf.h_advance(font.glyph_id(c))).sum()
+}
+
+/// Draw anti-aliased white text at pixel height `px`, blending each glyph's
+/// coverage over the (already darkened) background.
+fn draw_text_ttf(img: &mut RgbaImage, x: u32, y: u32, text: &str, px: f32, font: &FontVec) {
+    let sf = font.as_scaled(PxScale::from(px));
+    let ascent = sf.ascent();
+    let (iw, ih) = (img.width() as i32, img.height() as i32);
+    let mut caret = x as f32;
+    for ch in text.chars() {
+        let id = font.glyph_id(ch);
+        let glyph = id.with_scale_and_position(px, point(caret, y as f32 + ascent));
+        if let Some(outlined) = font.outline_glyph(glyph) {
+            let bounds = outlined.px_bounds();
+            outlined.draw(|gx, gy, cov| {
+                let tx = bounds.min.x as i32 + gx as i32;
+                let ty = bounds.min.y as i32 + gy as i32;
+                if tx >= 0 && ty >= 0 && tx < iw && ty < ih {
+                    let c = cov.clamp(0.0, 1.0);
+                    let p = img.get_pixel_mut(tx as u32, ty as u32);
+                    p[0] = (p[0] as f32 * (1.0 - c) + 255.0 * c) as u8;
+                    p[1] = (p[1] as f32 * (1.0 - c) + 255.0 * c) as u8;
+                    p[2] = (p[2] as f32 * (1.0 - c) + 255.0 * c) as u8;
+                }
+            });
+        }
+        caret += sf.h_advance(id);
+    }
+}
+
+fn fill_rect(img: &mut RgbaImage, x: u32, y: u32, w: u32, h: u32, color: Rgba<u8>) {
+    let (iw, ih) = (img.width(), img.height());
+    for yy in y..(y + h).min(ih) {
+        for xx in x..(x + w).min(iw) {
+            img.put_pixel(xx, yy, color);
+        }
+    }
+}
+
+fn darken_rect(img: &mut RgbaImage, x: u32, y: u32, w: u32, h: u32, amount: f32) {
+    let (iw, ih) = (img.width(), img.height());
+    let keep = (1.0 - amount).clamp(0.0, 1.0);
+    for yy in y..(y + h).min(ih) {
+        for xx in x..(x + w).min(iw) {
+            let p = img.get_pixel_mut(xx, yy);
+            p[0] = (p[0] as f32 * keep) as u8;
+            p[1] = (p[1] as f32 * keep) as u8;
+            p[2] = (p[2] as f32 * keep) as u8;
+        }
+    }
+}
+
+/// Advance per glyph is 5 px wide + 1 px spacing, scaled by `s`.
+fn text_width(text: &str, s: u32) -> u32 {
+    text.chars().count() as u32 * 6 * s
+}
+
+fn draw_text(img: &mut RgbaImage, x: u32, y: u32, text: &str, s: u32, color: Rgba<u8>) {
+    let mut cx = x;
+    for c in text.chars() {
+        draw_glyph(img, cx, y, c, s, color);
+        cx += 6 * s;
+    }
+}
+
+fn draw_glyph(img: &mut RgbaImage, x: u32, y: u32, c: char, s: u32, color: Rgba<u8>) {
+    for (row, bits) in glyph(c).iter().enumerate() {
+        for col in 0..5u32 {
+            if bits & (0x10 >> col) != 0 {
+                fill_rect(img, x + col * s, y + row as u32 * s, s, s, color);
+            }
+        }
+    }
+}
+
+/// 5×7 bitmap font for the glyphs the scale-bar label needs (digits, space,
+/// 'n', 'm'). Each row's low 5 bits are columns, MSB (0x10) = leftmost.
+fn glyph(c: char) -> [u8; 7] {
+    const SPACE: [u8; 7] = [0, 0, 0, 0, 0, 0, 0];
+    const DIGITS: [[u8; 7]; 10] = [
+        [0x0E, 0x11, 0x13, 0x15, 0x19, 0x11, 0x0E],
+        [0x04, 0x0C, 0x04, 0x04, 0x04, 0x04, 0x0E],
+        [0x0E, 0x11, 0x01, 0x02, 0x04, 0x08, 0x1F],
+        [0x1F, 0x02, 0x04, 0x02, 0x01, 0x11, 0x0E],
+        [0x02, 0x06, 0x0A, 0x12, 0x1F, 0x02, 0x02],
+        [0x1F, 0x10, 0x1E, 0x01, 0x01, 0x11, 0x0E],
+        [0x06, 0x08, 0x10, 0x1E, 0x11, 0x11, 0x0E],
+        [0x1F, 0x01, 0x02, 0x04, 0x08, 0x08, 0x08],
+        [0x0E, 0x11, 0x11, 0x0E, 0x11, 0x11, 0x0E],
+        [0x0E, 0x11, 0x11, 0x0F, 0x01, 0x02, 0x0C],
+    ];
+    const N: [u8; 7] = [0x00, 0x00, 0x16, 0x19, 0x11, 0x11, 0x11];
+    const M: [u8; 7] = [0x00, 0x00, 0x1A, 0x15, 0x15, 0x15, 0x15];
+    match c {
+        '0'..='9' => DIGITS[c as usize - '0' as usize],
+        'n' => N,
+        'm' => M,
+        _ => SPACE,
+    }
 }
 
 pub fn export_csv(profile: &[(f32, f32)], path: &Path) -> Result<(), String> {
@@ -112,6 +300,54 @@ pub fn export_profile_png(profile: &[(f32, f32)], path: &Path) -> Result<(), Str
 
     img.save(path)
         .map_err(|e| format!("Failed to save PNG: {e}"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn nice_scale_snaps_to_1_2_5() {
+        assert_eq!(nice_scale(190.0), 200.0);
+        assert_eq!(nice_scale(0.9), 1.0);
+        assert_eq!(nice_scale(3.0), 2.0);
+        assert_eq!(nice_scale(800.0), 1000.0);
+        assert_eq!(nice_scale(3000.0), 2000.0);
+    }
+
+    #[test]
+    fn scale_bar_has_expected_width() {
+        let (w, h) = (200u32, 200u32);
+        let mut img = RgbaImage::from_pixel(w, h, Rgba([0, 0, 0, 255]));
+        let scan = 1000.0_f32; // bar_nm = nice_scale(200) = 200 → 40 px
+        draw_scale_bar(&mut img, scan);
+
+        let expected = ((200.0 / scan) * w as f32).round() as u32; // 40
+        // Longest solid-white horizontal run = the bar (wider than any glyph).
+        let mut best = 0u32;
+        for y in 0..h {
+            let mut run = 0u32;
+            for x in 0..w {
+                if img.get_pixel(x, y).0 == [255, 255, 255, 255] {
+                    run += 1;
+                    best = best.max(run);
+                } else {
+                    run = 0;
+                }
+            }
+        }
+        assert!(
+            (best as i32 - expected as i32).abs() <= 2,
+            "bar width {best}, expected {expected}"
+        );
+    }
+
+    #[test]
+    fn scale_bar_is_noop_on_tiny_image() {
+        let mut img = RgbaImage::from_pixel(8, 8, Rgba([10, 20, 30, 255]));
+        draw_scale_bar(&mut img, 1000.0);
+        assert!(img.pixels().all(|p| p.0 == [10, 20, 30, 255]));
+    }
 }
 
 fn draw_line(img: &mut ImageBuffer<Rgb<u8>, Vec<u8>>, x0: i32, y0: i32, x1: i32, y1: i32, color: Rgb<u8>) {

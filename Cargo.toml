@@ -1,12 +1,12 @@
 [package]
 name = "afm_files"
-version = "0.2.4"
+version = "0.3.0"
 edition = "2021"
 
 [package.metadata.bundle]
 name = "Kintuba AFM Viewer"
 identifier = "io.github.indigocarmine.kintuba"
-version = "0.2.4"
+version = "0.3.0"
 icon = ["assets/AppIcon.icns"]
 
 copyright = "Copyright (c) Yuhei Yamada 2026. All rights reserved."
@@ -44,6 +44,7 @@ egui_plot = "0.35.0"
 glow      = "0.17"
 glam      = "0.29"
 bytemuck  = { version = "1", features = ["derive"] }
+ab_glyph  = "0.2"
 rfd       = "0.17.2"
 image     = "0.25"
 arboard   = "3"
