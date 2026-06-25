@@ -29,6 +29,13 @@ impl Colormap {
             Colormap::Viridis => viridis(t),
         }
     }
+
+    /// Map a normalized value `t` in [0, 1] to a linear RGB triple in [0, 1].
+    /// Used to color 3D mesh vertices with the same palette as the 2D view.
+    pub fn map_rgb_f32(self, t: f32) -> [f32; 3] {
+        let [r, g, b] = self.map_u8(t);
+        [r as f32 / 255.0, g as f32 / 255.0, b as f32 / 255.0]
+    }
 }
 
 pub fn to_rgba_bytes(

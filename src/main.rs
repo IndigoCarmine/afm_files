@@ -3,6 +3,7 @@ mod analysis;
 mod app;
 mod colormap;
 mod parser;
+mod view3d;
 
 fn setup_fonts(ctx: &egui::Context) {
     #[cfg(target_os = "windows")]
@@ -46,6 +47,8 @@ fn app_icon() -> egui::IconData {
 
 fn main() -> eframe::Result {
     let options = eframe::NativeOptions {
+        // The 3D surface tab needs a depth buffer for the glow renderer.
+        depth_buffer: 24,
         viewport: egui::ViewportBuilder::default()
             .with_title("Kintuba AFM Viewer")
             .with_inner_size([1200.0, 800.0])
@@ -57,7 +60,7 @@ fn main() -> eframe::Result {
         options,
         Box::new(|cc| {
             setup_fonts(&cc.egui_ctx);
-            Ok(Box::new(app::AfmViewerApp::default()))
+            Ok(Box::new(app::AfmViewerApp::new(cc)))
         }),
     )
 }

@@ -29,9 +29,21 @@ name = "afm_viewer"
 path = "src/main.rs"
 
 [dependencies]
-eframe    = "0.34.3"
+# Use the glow (OpenGL) backend for eframe: the 3D surface view renders via
+# egui_glow, and glow is lighter than the default wgpu backend.
+eframe    = { version = "0.34.3", default-features = false, features = [
+    "accesskit",
+    "default_fonts",
+    "glow",
+    "wayland",
+    "x11",
+] }
 egui      = "0.34.3"
+egui_glow = "0.34.3"
 egui_plot = "0.35.0"
+glow      = "0.17"
+glam      = "0.29"
+bytemuck  = { version = "1", features = ["derive"] }
 rfd       = "0.17.2"
 image     = "0.25"
 arboard   = "3"

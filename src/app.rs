@@ -1,15 +1,18 @@
 use crate::analysis::{export_afm_image, export_csv, export_profile_png, line_profile};
 use crate::colormap::{to_color_image, to_rgba_bytes, Colormap};
 use crate::parser::{load_spm, ChannelInfo, SpmImage};
+use crate::view3d::{OrbitalCamera, SurfaceRenderer};
 use egui::{TextureHandle, TextureOptions, Vec2};
 use egui_plot::{Line, Plot, PlotPoints, Points, VLine};
 use std::path::PathBuf;
+use std::sync::{Arc, Mutex};
 
 #[derive(PartialEq)]
 enum Tab {
     View,
     HeightAnalysis,
     Analysis,
+    View3D,
 }
 
 #[derive(PartialEq, Clone)]
@@ -68,6 +71,16 @@ pub struct AfmViewerApp {
     custom_kernel: Vec<f32>,
     analysis_texture: Option<TextureHandle>,
     analysis_texture_dirty: bool,
+
+    // 3D view
+    gl: Option<Arc<glow::Context>>,
+    camera: OrbitalCamera,
+    renderer: Option<Arc<Mutex<SurfaceRenderer>>>,
+    z_exaggeration: f32,
+    image_gen: u64,
+    // Cheap signature of the inputs the mesh depends on; when it changes the
+    // mesh is rebuilt. (z values stored as bits to keep the key Copy + Eq.)
+    mesh_key: Option<(u64, Colormap, u32, u32, u32)>,
 }
 
 impl Default for AfmViewerApp {
@@ -104,6 +117,22 @@ impl Default for AfmViewerApp {
             custom_kernel: vec![1.0, 2.0, 1.0],
             analysis_texture: None,
             analysis_texture_dirty: false,
+            gl: None,
+            camera: OrbitalCamera::default(),
+            renderer: None,
+            z_exaggeration: 0.6,
+            image_gen: 0,
+            mesh_key: None,
+        }
+    }
+}
+
+impl AfmViewerApp {
+    pub fn new(cc: &eframe::CreationContext<'_>) -> Self {
+        Self {
+            // Available when eframe runs on the glow backend (the default).
+            gl: cc.gl.clone(),
+            ..Self::default()
         }
     }
 }
@@ -305,6 +334,7 @@ impl AfmViewerApp {
                 self.available_channels = img.available_channels.clone();
                 self.rebuild_texture(ctx, &img);
                 self.image = Some(img);
+                self.image_gen += 1;
             }
             Err(e) => {
                 self.load_error = Some(e);
@@ -344,7 +374,6 @@ impl AfmViewerApp {
         self.texture = None;
         self.load_error = None;
 
-        #[cfg(target_os = "macos")]
         crate::parser::prefetch_cloud_files(self.files.clone());
     }
 
@@ -1155,6 +1184,105 @@ impl AfmViewerApp {
             );
         }
     }
+
+    fn show_view3d_tab(&mut self, ui: &mut egui::Ui) {
+        ui.horizontal(|ui| {
+            ui.label("Z exaggeration:");
+            ui.add(egui::Slider::new(&mut self.z_exaggeration, 0.05..=3.0).logarithmic(true));
+            if ui.button("Reset view").clicked() {
+                self.camera = OrbitalCamera::default();
+            }
+            ui.label("   Drag: orbit · Right-drag / Shift-drag: pan · Scroll: zoom");
+        });
+        ui.separator();
+
+        let Some(gl) = self.gl.clone() else {
+            ui.colored_label(
+                egui::Color32::LIGHT_RED,
+                "3D view requires the glow rendering backend.",
+            );
+            return;
+        };
+        if self.image.is_none() {
+            ui.label("Select a file to view its surface in 3D.");
+            return;
+        }
+
+        // Lazily create the GL renderer the first time the tab is shown.
+        if self.renderer.is_none() {
+            match SurfaceRenderer::new(&gl) {
+                Ok(r) => self.renderer = Some(Arc::new(Mutex::new(r))),
+                Err(e) => {
+                    ui.colored_label(egui::Color32::LIGHT_RED, format!("Renderer init failed: {e}"));
+                    return;
+                }
+            }
+        }
+        let renderer = self.renderer.clone().unwrap();
+
+        // Rebuild the mesh only when an input it depends on has changed.
+        let key = (
+            self.image_gen,
+            self.colormap,
+            self.z_min.to_bits(),
+            self.z_max.to_bits(),
+            self.z_exaggeration.to_bits(),
+        );
+        if self.mesh_key != Some(key) {
+            if let Some(ref img) = self.image {
+                renderer.lock().unwrap().set_mesh(
+                    img,
+                    self.colormap,
+                    self.z_min,
+                    self.z_max,
+                    self.z_exaggeration,
+                );
+                self.mesh_key = Some(key);
+            }
+        }
+
+        // Camera interaction over the drawing area.
+        let size = ui.available_size();
+        let (rect, response) = ui.allocate_exact_size(size, egui::Sense::drag());
+        if response.dragged() {
+            let delta = response.drag_delta();
+            let pan = response.dragged_by(egui::PointerButton::Secondary)
+                || ui.input(|i| i.modifiers.shift);
+            if pan {
+                self.camera.pan(delta);
+            } else {
+                self.camera.orbit(delta);
+            }
+        }
+        if response.hovered() {
+            let scroll = ui.input(|i| i.smooth_scroll_delta.y);
+            if scroll != 0.0 {
+                self.camera.dolly(scroll);
+            }
+        }
+
+        // Resolve the camera to an MVP matrix and hand rendering to glow.
+        let aspect = rect.width() / rect.height().max(1.0);
+        let mvp = self.camera.view_proj(aspect);
+        let light_dir = glam::Vec3::new(0.4, 1.0, 0.6);
+        let cb = egui_glow::CallbackFn::new(move |info, painter| {
+            let vp = info.viewport_in_pixels();
+            let viewport = [
+                vp.left_px as i32,
+                vp.from_bottom_px as i32,
+                vp.width_px as i32,
+                vp.height_px as i32,
+            ];
+            renderer
+                .lock()
+                .unwrap()
+                .paint(painter.gl(), &mvp, light_dir, viewport);
+        });
+        ui.painter().add(egui::PaintCallback {
+            rect,
+            callback: Arc::new(cb),
+        });
+    }
 }
 
 impl eframe::App for AfmViewerApp {
@@ -1194,6 +1322,9 @@ impl eframe::App for AfmViewerApp {
                 {
                     self.tab = Tab::Analysis;
                 }
+                if ui.selectable_label(self.tab == Tab::View3D, "3D").clicked() {
+                    self.tab = Tab::View3D;
+                }
             });
             ui.separator();
 
@@ -1201,7 +1332,14 @@ impl eframe::App for AfmViewerApp {
                 Tab::View => self.show_view_tab(ui, ctx),
                 Tab::HeightAnalysis => self.show_analysis_tab(ui, ctx),
                 Tab::Analysis => self.show_filter_tab(ui, ctx),
+                Tab::View3D => self.show_view3d_tab(ui),
             }
         });
+    }
+
+    fn on_exit(&mut self, gl: Option<&glow::Context>) {
+        if let (Some(gl), Some(renderer)) = (gl, &self.renderer) {
+            renderer.lock().unwrap().destroy(gl);
+        }
     }
 }
