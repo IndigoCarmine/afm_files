@@ -302,9 +302,180 @@ pub fn export_profile_png(profile: &[(f32, f32)], path: &Path) -> Result<(), Str
         .map_err(|e| format!("Failed to save PNG: {e}"))
 }
 
+/// Rolling-ball background subtraction (Sternberg). Returns `data` with the
+/// estimated background removed; `radius` is the ball radius in pixels.
+///
+/// The height field is normalized to a fixed 0..100 working range so the ball
+/// (a sphere of radius `radius` in that calibrated space) behaves consistently
+/// regardless of the data's physical units. For speed the image is shrunk for
+/// large radii (à la ImageJ), the ball rolled on the small image, and the
+/// background bilinearly enlarged before subtraction. The result is always
+/// ≥ 0 (morphological opening is anti-extensive), i.e. background ≈ 0.
+pub fn rolling_ball_subtract(data: &[f32], w: usize, h: usize, radius: usize) -> Vec<f32> {
+    if radius == 0 || w == 0 || h == 0 || data.len() < w * h {
+        return data.to_vec();
+    }
+    let min = data.iter().cloned().fold(f32::INFINITY, f32::min);
+    let max = data.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+    let range = (max - min).max(f32::EPSILON);
+    const WORK: f32 = 100.0;
+
+    let norm: Vec<f32> = data.iter().map(|&v| (v - min) / range * WORK).collect();
+    let background = rolling_ball_background(&norm, w, h, radius);
+
+    data.iter()
+        .zip(background.iter())
+        .map(|(&v, &bg)| v - (bg / WORK * range + min))
+        .collect()
+}
+
+/// Estimate the background of a 0..100 normalized field by rolling a ball of
+/// `radius` px underneath it (grayscale opening), shrinking first for speed.
+fn rolling_ball_background(norm: &[f32], w: usize, h: usize, radius: usize) -> Vec<f32> {
+    let shrink = if radius <= 10 {
+        1
+    } else if radius <= 30 {
+        2
+    } else if radius <= 100 {
+        4
+    } else {
+        8
+    };
+    let small_r = (radius / shrink).max(1);
+
+    let (sw, sh, small) = shrink_min(norm, w, h, shrink);
+    let small_bg = ball_opening(&small, sw, sh, small_r);
+    enlarge(&small_bg, sw, sh, w, h)
+}
+
+/// Downsample by taking the minimum of each `k`×`k` block (the ball rolls under
+/// the surface, so the background follows the local minima).
+fn shrink_min(data: &[f32], w: usize, h: usize, k: usize) -> (usize, usize, Vec<f32>) {
+    if k <= 1 {
+        return (w, h, data.to_vec());
+    }
+    let sw = w.div_ceil(k);
+    let sh = h.div_ceil(k);
+    let mut out = vec![f32::INFINITY; sw * sh];
+    for y in 0..h {
+        for x in 0..w {
+            let o = (y / k) * sw + (x / k);
+            out[o] = out[o].min(data[y * w + x]);
+        }
+    }
+    (sw, sh, out)
+}
+
+/// Grayscale opening (erode then dilate) with a spherical structuring element.
+fn ball_opening(g: &[f32], w: usize, h: usize, r: usize) -> Vec<f32> {
+    let ball = build_ball(r);
+    let eroded = ball_morph(g, w, h, &ball, false);
+    ball_morph(&eroded, w, h, &ball, true)
+}
+
+/// Offsets (di, dj) within radius `r` and the ball's height there (√(r²−d²)).
+fn build_ball(r: usize) -> Vec<(i32, i32, f32)> {
+    let ri = r as i32;
+    let r2 = (r * r) as f32;
+    let mut ball = Vec::new();
+    for dj in -ri..=ri {
+        for di in -ri..=ri {
+            let d2 = (di * di + dj * dj) as f32;
+            if d2 <= r2 {
+                ball.push((di, dj, (r2 - d2).sqrt()));
+            }
+        }
+    }
+    ball
+}
+
+/// One morphological pass with the (symmetric) ball SE: erosion (`dilate=false`)
+/// computes min(g − ball); dilation (`dilate=true`) computes max(g + ball).
+/// Out-of-bounds samples use edge replication.
+fn ball_morph(g: &[f32], w: usize, h: usize, ball: &[(i32, i32, f32)], dilate: bool) -> Vec<f32> {
+    let (wi, hi) = (w as i32, h as i32);
+    let mut out = vec![0.0f32; w * h];
+    for y in 0..h {
+        for x in 0..w {
+            let mut acc = if dilate { f32::NEG_INFINITY } else { f32::INFINITY };
+            for &(di, dj, bh) in ball {
+                let xx = (x as i32 + di).clamp(0, wi - 1) as usize;
+                let yy = (y as i32 + dj).clamp(0, hi - 1) as usize;
+                let s = g[yy * w + xx];
+                if dilate {
+                    acc = acc.max(s + bh);
+                } else {
+                    acc = acc.min(s - bh);
+                }
+            }
+            out[y * w + x] = acc;
+        }
+    }
+    out
+}
+
+/// Bilinearly enlarge an `sw`×`sh` field to `w`×`h` (corners aligned).
+fn enlarge(small: &[f32], sw: usize, sh: usize, w: usize, h: usize) -> Vec<f32> {
+    if sw == w && sh == h {
+        return small.to_vec();
+    }
+    let mut out = vec![0.0f32; w * h];
+    let sx = if w > 1 { (sw - 1) as f32 / (w - 1) as f32 } else { 0.0 };
+    let sy = if h > 1 { (sh - 1) as f32 / (h - 1) as f32 } else { 0.0 };
+    for y in 0..h {
+        let gy = y as f32 * sy;
+        let y0 = gy.floor() as usize;
+        let y1 = (y0 + 1).min(sh - 1);
+        let ty = gy - y0 as f32;
+        for x in 0..w {
+            let gx = x as f32 * sx;
+            let x0 = gx.floor() as usize;
+            let x1 = (x0 + 1).min(sw - 1);
+            let tx = gx - x0 as f32;
+            let v00 = small[y0 * sw + x0];
+            let v01 = small[y0 * sw + x1];
+            let v10 = small[y1 * sw + x0];
+            let v11 = small[y1 * sw + x1];
+            let top = v00 + (v01 - v00) * tx;
+            let bot = v10 + (v11 - v10) * tx;
+            out[y * w + x] = top + (bot - top) * ty;
+        }
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn rolling_ball_noop_for_zero_radius() {
+        let data = vec![1.0, 2.0, 3.0, 4.0];
+        assert_eq!(rolling_ball_subtract(&data, 2, 2, 0), data);
+    }
+
+    #[test]
+    fn rolling_ball_flattens_constant() {
+        let (w, h) = (32, 32);
+        let data = vec![5.0f32; w * h];
+        let out = rolling_ball_subtract(&data, w, h, 8);
+        assert!(out.iter().all(|&v| v.abs() < 1e-3));
+    }
+
+    #[test]
+    fn rolling_ball_keeps_narrow_feature_removes_background() {
+        let (w, h) = (40, 40);
+        let mut data = vec![0.0f32; w * h];
+        for y in 19..21 {
+            for x in 19..21 {
+                data[y * w + x] = 10.0; // tiny bump, much smaller than the ball
+            }
+        }
+        let out = rolling_ball_subtract(&data, w, h, 10);
+        assert!(out[20 * w + 20] > 5.0, "feature preserved: {}", out[20 * w + 20]);
+        assert!(out[0].abs() < 1.0, "background removed: {}", out[0]);
+        assert!(out.iter().all(|&v| v.is_finite() && v >= -1e-3));
+    }
 
     #[test]
     fn nice_scale_snaps_to_1_2_5() {

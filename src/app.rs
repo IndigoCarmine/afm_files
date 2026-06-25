@@ -41,6 +41,8 @@ pub struct AfmViewerApp {
     colormap: Colormap,
     flatten_order: Option<u32>,
     smooth_sigma: f32,
+    rolling_ball: bool,
+    rolling_ball_radius: u32,
     z_min: f32,
     z_max: f32,
     z_data_min: f32,
@@ -104,6 +106,8 @@ impl Default for AfmViewerApp {
             colormap: Colormap::AfmHot,
             flatten_order: Some(2),
             smooth_sigma: 0.0,
+            rolling_ball: false,
+            rolling_ball_radius: 30,
             z_min: 0.0,
             z_max: 1.0,
             z_data_min: 0.0,
@@ -321,7 +325,15 @@ impl AfmViewerApp {
         };
 
         match load_spm(&path, self.flatten_order, self.smooth_sigma, channel) {
-            Ok(img) => {
+            Ok(mut img) => {
+                if self.rolling_ball {
+                    img.data = crate::analysis::rolling_ball_subtract(
+                        &img.data,
+                        img.samps_per_line,
+                        img.number_of_lines,
+                        self.rolling_ball_radius as usize,
+                    );
+                }
                 let z_min = img.data.iter().cloned().fold(f32::INFINITY, f32::min);
                 let z_max = img.data.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
                 self.z_data_min = z_min;
@@ -447,6 +459,24 @@ impl AfmViewerApp {
                     .suffix(" px"),
             );
             if (self.smooth_sigma - prev_sigma).abs() > f32::EPSILON {
+                if let Some(idx) = self.selected {
+                    self.load_file(ctx, idx);
+                }
+            }
+
+            ui.separator();
+
+            let prev_rb = self.rolling_ball;
+            let prev_radius = self.rolling_ball_radius;
+            ui.checkbox(&mut self.rolling_ball, "Rolling ball");
+            ui.add_enabled(
+                self.rolling_ball,
+                egui::DragValue::new(&mut self.rolling_ball_radius)
+                    .speed(1.0)
+                    .range(1..=300)
+                    .suffix(" px"),
+            );
+            if self.rolling_ball != prev_rb || self.rolling_ball_radius != prev_radius {
                 if let Some(idx) = self.selected {
                     self.load_file(ctx, idx);
                 }
