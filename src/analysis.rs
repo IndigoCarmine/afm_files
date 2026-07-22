@@ -309,6 +309,29 @@ pub fn export_profile_png(profile: &[(f32, f32)], path: &Path) -> Result<(), Str
         .map_err(|e| format!("Failed to save PNG: {e}"))
 }
 
+/// Pick a display z-range that avoids a mostly-black image. Background-heavy
+/// data (e.g. after rolling-ball subtraction, where the background sits near
+/// zero and only a small area carries real signal) linearly maps to a mean
+/// brightness far below `TARGET_MEAN`, crushing most of the image to near
+/// black. When that happens, extend `z_min` below the true data minimum so
+/// the average pixel reaches `TARGET_MEAN`; `z_max` is left untouched so the
+/// brightest real features still map to full white. Well-exposed data (mean
+/// brightness already at or above target) is returned unchanged.
+pub fn judge_display_range(data: &[f32], min: f32, max: f32) -> (f32, f32) {
+    const TARGET_MEAN: f32 = 0.35;
+    let range = max - min;
+    if range < f32::EPSILON || data.is_empty() {
+        return (min, max);
+    }
+    let mean_v = data.iter().sum::<f32>() / data.len() as f32;
+    let mean_t = (mean_v - min) / range;
+    if mean_t >= TARGET_MEAN {
+        return (min, max);
+    }
+    let adjusted_min = (mean_v - TARGET_MEAN * max) / (1.0 - TARGET_MEAN);
+    (adjusted_min, max)
+}
+
 /// Rolling-ball background subtraction (Sternberg). Returns `data` with the
 /// estimated background removed; `radius` is the ball radius in pixels.
 ///
@@ -493,6 +516,39 @@ mod tests {
     fn rolling_ball_noop_for_zero_radius() {
         let data = vec![1.0, 2.0, 3.0, 4.0];
         assert_eq!(rolling_ball_subtract(&data, 2, 2, 0), data);
+    }
+
+    #[test]
+    fn judge_display_range_leaves_well_exposed_data_alone() {
+        // Mean sits at 0.5 of the range, well above the darkness threshold.
+        let data = vec![0.0, 5.0, 10.0];
+        let (lo, hi) = judge_display_range(&data, 0.0, 10.0);
+        assert_eq!((lo, hi), (0.0, 10.0));
+    }
+
+    #[test]
+    fn judge_display_range_brightens_background_heavy_data() {
+        // 90% background at 0, 10% peak averaging 5 → mean = 0.5, far below
+        // the 35% target when linearly mapped into 0..10.
+        let mut data = vec![0.0f32; 90];
+        data.extend(vec![5.0f32; 10]);
+        let (lo, hi) = judge_display_range(&data, 0.0, 10.0);
+        assert!(lo < 0.0, "z_min should extend below the true minimum: {lo}");
+        assert_eq!(hi, 10.0, "z_max must stay untouched so peaks stay white");
+
+        let mean_v: f32 = data.iter().sum::<f32>() / data.len() as f32;
+        let mean_t = (mean_v - lo) / (hi - lo);
+        assert!(
+            (mean_t - 0.35).abs() < 1e-4,
+            "adjusted range should hit the target mean brightness: {mean_t}"
+        );
+    }
+
+    #[test]
+    fn judge_display_range_noop_on_flat_data() {
+        let data = vec![3.0f32; 16];
+        let (lo, hi) = judge_display_range(&data, 3.0, 3.0);
+        assert_eq!((lo, hi), (3.0, 3.0));
     }
 
     #[test]

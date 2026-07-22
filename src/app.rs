@@ -349,8 +349,10 @@ impl AfmViewerApp {
                 let z_max = img.data.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
                 self.z_data_min = z_min;
                 self.z_data_max = z_max;
-                self.z_min = z_min;
-                self.z_max = z_max;
+                let (disp_min, disp_max) =
+                    crate::analysis::judge_display_range(&img.data, z_min, z_max);
+                self.z_min = disp_min;
+                self.z_max = disp_max;
                 if is_new_file {
                     self.channel_idx = img.channel_idx;
                 }
@@ -681,7 +683,7 @@ impl AfmViewerApp {
         painter.rect_stroke(
             rect,
             0.0,
-            egui::Stroke::new(1.0, egui::Color32::BLACK),
+            egui::Stroke::new(1.0_f32, egui::Color32::BLACK),
             egui::StrokeKind::Inside,
         );
 
@@ -697,7 +699,7 @@ impl AfmViewerApp {
                     egui::pos2(bar_x0, bar_y),
                     egui::pos2(bar_x0 + bar_px, bar_y),
                 ],
-                egui::Stroke::new(3.0, egui::Color32::WHITE),
+                egui::Stroke::new(3.0_f32, egui::Color32::WHITE),
             );
             painter.text(
                 egui::pos2(bar_x0 + bar_px + 4.0, bar_y),
@@ -776,7 +778,7 @@ impl AfmViewerApp {
             painter.rect_stroke(
                 rect,
                 0.0,
-                egui::Stroke::new(1.0, egui::Color32::from_gray(100)),
+                egui::Stroke::new(1.0_f32, egui::Color32::from_gray(100)),
                 egui::StrokeKind::Outside,
             );
 
@@ -883,18 +885,23 @@ impl AfmViewerApp {
                 let sp0 = frac_to_screen(p0, rect, self.zoom, self.pan);
                 if let Some(p1) = self.line_p1 {
                     let sp1 = frac_to_screen(p1, rect, self.zoom, self.pan);
-                    painter.line_segment([sp0, sp1], egui::Stroke::new(2.0, egui::Color32::WHITE));
+                    painter
+                        .line_segment([sp0, sp1], egui::Stroke::new(2.0_f32, egui::Color32::WHITE));
                     // p1 = red
                     painter.circle_filled(sp1, HANDLE_R, egui::Color32::RED);
                     painter.circle_stroke(
                         sp1,
                         HANDLE_R,
-                        egui::Stroke::new(1.5, egui::Color32::WHITE),
+                        egui::Stroke::new(1.5_f32, egui::Color32::WHITE),
                     );
                 }
                 // p0 = green
                 painter.circle_filled(sp0, HANDLE_R, egui::Color32::GREEN);
-                painter.circle_stroke(sp0, HANDLE_R, egui::Stroke::new(1.5, egui::Color32::WHITE));
+                painter.circle_stroke(
+                    sp0,
+                    HANDLE_R,
+                    egui::Stroke::new(1.5_f32, egui::Color32::WHITE),
+                );
             }
 
             // ── cross-section plot ───────────────────────────────────────────
@@ -945,28 +952,28 @@ impl AfmViewerApp {
                                 plot_ui.vline(
                                     VLine::new("A", xa)
                                         .color(egui::Color32::from_rgb(50, 130, 255))
-                                        .width(1.5),
+                                        .width(1.5_f32),
                                 );
                             }
                             if let Some(xb) = mb {
                                 plot_ui.vline(
                                     VLine::new("B", xb)
                                         .color(egui::Color32::from_rgb(220, 60, 60))
-                                        .width(1.5),
+                                        .width(1.5_f32),
                                 );
                             }
 
                             if let (Some(xa), Some(ha)) = (ma, ma_h) {
                                 plot_ui.points(
                                     Points::new("A", vec![[xa, ha]])
-                                        .radius(5.0)
+                                        .radius(5.0_f32)
                                         .color(egui::Color32::from_rgb(50, 130, 255)),
                                 );
                             }
                             if let (Some(xb), Some(hb)) = (mb, mb_h) {
                                 plot_ui.points(
                                     Points::new("B", vec![[xb, hb]])
-                                        .radius(5.0)
+                                        .radius(5.0_f32)
                                         .color(egui::Color32::from_rgb(220, 60, 60)),
                                 );
                             }
@@ -977,7 +984,7 @@ impl AfmViewerApp {
                                         .color(egui::Color32::from_rgba_premultiplied(
                                             200, 200, 200, 160,
                                         ))
-                                        .width(1.0),
+                                        .width(1.0_f32),
                                 );
                             }
 
@@ -1239,7 +1246,7 @@ impl AfmViewerApp {
         painter.rect_stroke(
             rect,
             0.0,
-            egui::Stroke::new(5.0, egui::Color32::BLACK),
+            egui::Stroke::new(5.0_f32, egui::Color32::BLACK),
             egui::StrokeKind::Inside,
         );
 
@@ -1253,7 +1260,7 @@ impl AfmViewerApp {
                     egui::pos2(bar_x0, bar_y),
                     egui::pos2(bar_x0 + bar_px, bar_y),
                 ],
-                egui::Stroke::new(3.0, egui::Color32::WHITE),
+                egui::Stroke::new(3.0_f32, egui::Color32::WHITE),
             );
             painter.text(
                 egui::pos2(bar_x0 + bar_px + 4.0, bar_y),
