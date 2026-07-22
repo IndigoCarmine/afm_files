@@ -215,7 +215,13 @@ impl SurfaceRenderer {
         z_color_max: f32,
         z_exaggeration: f32,
     ) {
-        self.pending = Some(build_mesh(img, cmap, z_color_min, z_color_max, z_exaggeration));
+        self.pending = Some(build_mesh(
+            img,
+            cmap,
+            z_color_min,
+            z_color_max,
+            z_exaggeration,
+        ));
     }
 
     pub fn paint(&mut self, gl: &glow::Context, mvp: &Mat4, light_dir: Vec3, viewport: [i32; 4]) {
@@ -294,8 +300,16 @@ impl SurfaceRenderer {
                 glow::UNSIGNED_BYTE,
                 glow::PixelUnpackData::Slice(None),
             );
-            gl.tex_parameter_i32(glow::TEXTURE_2D, glow::TEXTURE_MIN_FILTER, glow::NEAREST as i32);
-            gl.tex_parameter_i32(glow::TEXTURE_2D, glow::TEXTURE_MAG_FILTER, glow::NEAREST as i32);
+            gl.tex_parameter_i32(
+                glow::TEXTURE_2D,
+                glow::TEXTURE_MIN_FILTER,
+                glow::NEAREST as i32,
+            );
+            gl.tex_parameter_i32(
+                glow::TEXTURE_2D,
+                glow::TEXTURE_MAG_FILTER,
+                glow::NEAREST as i32,
+            );
             gl.bind_texture(glow::TEXTURE_2D, None);
 
             let depth = gl.create_renderbuffer()?;
@@ -581,6 +595,10 @@ mod tests {
         for _ in 0..50 {
             cam.orbit(egui::Vec2::new(37.0, -21.0));
         }
-        assert!(cam.right().y.abs() < 1e-4, "right axis tilted: {}", cam.right().y);
+        assert!(
+            cam.right().y.abs() < 1e-4,
+            "right axis tilted: {}",
+            cam.right().y
+        );
     }
 }

@@ -239,7 +239,11 @@ fn custom_kernel_filter_2d(data: &[f32], width: usize, height: usize, kernel: &[
                     ws += kv;
                 }
             }
-            out[i * stride] = if ws.abs() > f32::EPSILON { sum / ws } else { src[i * stride] };
+            out[i * stride] = if ws.abs() > f32::EPSILON {
+                sum / ws
+            } else {
+                src[i * stride]
+            };
         }
     };
 
@@ -270,12 +274,18 @@ impl AfmViewerApp {
         if let Some(ref img) = self.image {
             let filtered = match self.profile_filter {
                 ProfileFilter::None => img.data.clone(),
-                ProfileFilter::Gaussian => {
-                    gaussian_filter_2d(&img.data, img.samps_per_line, img.number_of_lines, self.filter_sigma)
-                }
-                ProfileFilter::Custom => {
-                    custom_kernel_filter_2d(&img.data, img.samps_per_line, img.number_of_lines, &self.custom_kernel)
-                }
+                ProfileFilter::Gaussian => gaussian_filter_2d(
+                    &img.data,
+                    img.samps_per_line,
+                    img.number_of_lines,
+                    self.filter_sigma,
+                ),
+                ProfileFilter::Custom => custom_kernel_filter_2d(
+                    &img.data,
+                    img.samps_per_line,
+                    img.number_of_lines,
+                    &self.custom_kernel,
+                ),
             };
             let ci = to_color_image(
                 &filtered,
@@ -285,7 +295,8 @@ impl AfmViewerApp {
                 self.z_min,
                 self.z_max,
             );
-            self.analysis_texture = Some(ctx.load_texture("analysis_image", ci, TextureOptions::NEAREST));
+            self.analysis_texture =
+                Some(ctx.load_texture("analysis_image", ci, TextureOptions::NEAREST));
         }
         self.analysis_texture_dirty = false;
     }
@@ -621,7 +632,7 @@ impl AfmViewerApp {
                 }
             }
             if !self.status_msg.is_empty() {
-                ui.label(&self.status_msg.clone());
+                ui.label(self.status_msg.clone());
             }
         });
 
@@ -667,7 +678,12 @@ impl AfmViewerApp {
         }
 
         // Border around image area
-        painter.rect_stroke(rect, 0.0, egui::Stroke::new(1.0, egui::Color32::BLACK), egui::StrokeKind::Inside);
+        painter.rect_stroke(
+            rect,
+            0.0,
+            egui::Stroke::new(1.0, egui::Color32::BLACK),
+            egui::StrokeKind::Inside,
+        );
 
         // Scale bar
         if let Some(ref img) = self.image {
@@ -711,7 +727,7 @@ impl AfmViewerApp {
                 self.status_msg.clear();
             }
             if !self.status_msg.is_empty() {
-                ui.label(&self.status_msg.clone());
+                ui.label(self.status_msg.clone());
             }
         });
 
@@ -757,7 +773,12 @@ impl AfmViewerApp {
             }
 
             // Border around image area
-            painter.rect_stroke(rect, 0.0, egui::Stroke::new(1.0, egui::Color32::from_gray(100)), egui::StrokeKind::Outside);
+            painter.rect_stroke(
+                rect,
+                0.0,
+                egui::Stroke::new(1.0, egui::Color32::from_gray(100)),
+                egui::StrokeKind::Outside,
+            );
 
             // ── handle drag start ────────────────────────────────────────────
             const HANDLE_R: f32 = 7.0;
@@ -903,8 +924,8 @@ impl AfmViewerApp {
 
                     let ma = self.plot_marker_a;
                     let mb = self.plot_marker_b;
-                    let ma_h = ma.map(|x| interp_height(x));
-                    let mb_h = mb.map(|x| interp_height(x));
+                    let ma_h = ma.map(&interp_height);
+                    let mb_h = mb.map(interp_height);
 
                     let curve: PlotPoints =
                         profile.iter().map(|&(d, h)| [d as f64, h as f64]).collect();
@@ -1085,7 +1106,11 @@ impl AfmViewerApp {
                 })
                 .show_ui(ui, |ui| {
                     ui.selectable_value(&mut self.profile_filter, ProfileFilter::None, "None");
-                    ui.selectable_value(&mut self.profile_filter, ProfileFilter::Gaussian, "Gaussian");
+                    ui.selectable_value(
+                        &mut self.profile_filter,
+                        ProfileFilter::Gaussian,
+                        "Gaussian",
+                    );
                     ui.selectable_value(&mut self.profile_filter, ProfileFilter::Custom, "Custom");
                 });
             if self.profile_filter != prev {
@@ -1109,10 +1134,12 @@ impl AfmViewerApp {
                 ProfileFilter::Custom => {
                     ui.label("Kernel (separable 1D):");
                     ui.add(
-                        egui::TextEdit::singleline(&mut self.custom_kernel_str).desired_width(160.0),
+                        egui::TextEdit::singleline(&mut self.custom_kernel_str)
+                            .desired_width(160.0),
                     );
                     if ui.button("Apply").clicked() {
-                        self.custom_kernel = self.custom_kernel_str
+                        self.custom_kernel = self
+                            .custom_kernel_str
                             .split(',')
                             .filter_map(|s| s.trim().parse::<f32>().ok())
                             .collect();
@@ -1129,13 +1156,22 @@ impl AfmViewerApp {
                     let filtered = match self.profile_filter {
                         ProfileFilter::None => img.data.clone(),
                         ProfileFilter::Gaussian => gaussian_filter_2d(
-                            &img.data, img.samps_per_line, img.number_of_lines, self.filter_sigma,
+                            &img.data,
+                            img.samps_per_line,
+                            img.number_of_lines,
+                            self.filter_sigma,
                         ),
                         ProfileFilter::Custom => custom_kernel_filter_2d(
-                            &img.data, img.samps_per_line, img.number_of_lines, &self.custom_kernel,
+                            &img.data,
+                            img.samps_per_line,
+                            img.number_of_lines,
+                            &self.custom_kernel,
                         ),
                     };
-                    if let Some(path) = rfd::FileDialog::new().add_filter("PNG", &["png"]).save_file() {
+                    if let Some(path) = rfd::FileDialog::new()
+                        .add_filter("PNG", &["png"])
+                        .save_file()
+                    {
                         match export_afm_image(
                             &filtered,
                             img.number_of_lines,
@@ -1155,7 +1191,7 @@ impl AfmViewerApp {
             }
 
             if !self.status_msg.is_empty() {
-                ui.label(&self.status_msg.clone());
+                ui.label(self.status_msg.clone());
             }
         });
 
@@ -1200,7 +1236,12 @@ impl AfmViewerApp {
             );
         }
 
-        painter.rect_stroke(rect, 0.0, egui::Stroke::new(5.0, egui::Color32::BLACK), egui::StrokeKind::Inside);
+        painter.rect_stroke(
+            rect,
+            0.0,
+            egui::Stroke::new(5.0, egui::Color32::BLACK),
+            egui::StrokeKind::Inside,
+        );
 
         if let Some(ref img) = self.image {
             let bar_nm = nice_scale(img.scan_size_nm / 5.0);
@@ -1208,7 +1249,10 @@ impl AfmViewerApp {
             let bar_y = rect.max.y - 12.0;
             let bar_x0 = rect.min.x + 10.0;
             painter.line_segment(
-                [egui::pos2(bar_x0, bar_y), egui::pos2(bar_x0 + bar_px, bar_y)],
+                [
+                    egui::pos2(bar_x0, bar_y),
+                    egui::pos2(bar_x0 + bar_px, bar_y),
+                ],
                 egui::Stroke::new(3.0, egui::Color32::WHITE),
             );
             painter.text(
@@ -1269,7 +1313,10 @@ impl AfmViewerApp {
             match SurfaceRenderer::new(&gl) {
                 Ok(r) => self.renderer = Some(Arc::new(Mutex::new(r))),
                 Err(e) => {
-                    ui.colored_label(egui::Color32::LIGHT_RED, format!("Renderer init failed: {e}"));
+                    ui.colored_label(
+                        egui::Color32::LIGHT_RED,
+                        format!("Renderer init failed: {e}"),
+                    );
                     return;
                 }
             }
@@ -1346,12 +1393,7 @@ impl AfmViewerApp {
                 export_ctx.request_repaint();
             }
             let vp = info.viewport_in_pixels();
-            let viewport = [
-                vp.left_px as i32,
-                vp.from_bottom_px as i32,
-                vp.width_px as i32,
-                vp.height_px as i32,
-            ];
+            let viewport = [vp.left_px, vp.from_bottom_px, vp.width_px, vp.height_px];
             r.paint(gl, &mvp, light_dir, viewport);
         });
         ui.painter().add(egui::PaintCallback {
@@ -1365,13 +1407,18 @@ impl eframe::App for AfmViewerApp {
     // Required by eframe 0.34 — our actual logic lives in `update`.
     fn ui(&mut self, _ui: &mut egui::Ui, _frame: &mut eframe::Frame) {}
 
+    // egui 0.34 deprecated the top-level `Panel::show(ctx, ...)` in favor of
+    // `show_inside()`, but as of this version there is no non-deprecated way
+    // to attach a panel directly to the `Context` at the root of the frame
+    // (egui's own internals still implement `show()` this way).
+    #[allow(deprecated)]
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
-        egui::TopBottomPanel::top("toolbar").show(ctx, |ui| {
+        egui::Panel::top("toolbar").show(ctx, |ui| {
             self.show_toolbar(ui, ctx);
         });
 
-        egui::SidePanel::left("file_panel")
-            .min_width(200.0)
+        egui::Panel::left("file_panel")
+            .min_size(200.0)
             .show(ctx, |ui| {
                 ui.heading("Files");
                 if let Some(ref folder) = self.folder.clone() {

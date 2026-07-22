@@ -1,0 +1,10 @@
+[Desktop Entry]
+Type=Application
+Name=Kintuba AFM Viewer
+GenericName=AFM Viewer
+Comment=View and analyze Bruker Nanoscope SPM files
+Exec=afm_viewer
+Icon=kintuba-afm-viewer
+Terminal=false
+Categories=Graphics;Science;
+StartupNotify=true

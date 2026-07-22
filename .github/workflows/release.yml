@@ -1,0 +1,264 @@
+name: Release
+
+# Pushing a `v*` tag builds installers for all three platforms and publishes
+# them as a GitHub Release. `workflow_dispatch` builds the same artifacts
+# without releasing, which is handy for testing changes to this file.
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+
+env:
+  BIN_NAME: afm_viewer
+  APP_NAME: kintuba-afm-viewer
+  CARGO_TERM_COLOR: always
+
+jobs:
+  # ---------------------------------------------------------------- Windows --
+  windows:
+    name: Windows installer
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Derive version
+        id: version
+        shell: bash
+        run: |
+          if [ "$GITHUB_REF_TYPE" = "tag" ]; then
+            echo "value=${GITHUB_REF_NAME#v}" >> "$GITHUB_OUTPUT"
+          else
+            echo "value=0.0.0-dev" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Build
+        run: cargo build --release
+
+      - name: Build installer (Inno Setup)
+        shell: pwsh
+        run: |
+          # Inno Setup 6 is preinstalled on the windows-latest runner image.
+          $iscc = "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe"
+          & $iscc "/DMyAppVersion=${{ steps.version.outputs.value }}" installer\windows.iss
+
+      - name: Stage artifacts
+        shell: bash
+        run: |
+          mkdir -p out
+          cp "target/release/${BIN_NAME}.exe" "out/${APP_NAME}-${{ steps.version.outputs.value }}-windows-x64.exe"
+          cp dist/*.exe out/
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: windows
+          path: out/*
+          if-no-files-found: error
+
+  # ------------------------------------------------------------------ macOS --
+  macos:
+    name: macOS installer
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-apple-darwin,aarch64-apple-darwin
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Derive version
+        id: version
+        run: |
+          if [ "$GITHUB_REF_TYPE" = "tag" ]; then
+            echo "value=${GITHUB_REF_NAME#v}" >> "$GITHUB_OUTPUT"
+          else
+            echo "value=0.0.0-dev" >> "$GITHUB_OUTPUT"
+          fi
+
+      # cargo-bundle is not available via taiki-e/install-action, so it has to be
+      # compiled. Swatinem/rust-cache above keeps this out of the critical path
+      # on subsequent runs.
+      - name: Install cargo-bundle and create-dmg
+        run: |
+          cargo install cargo-bundle --locked
+          brew install create-dmg
+
+      - name: Build (both architectures)
+        run: |
+          cargo build --release --target x86_64-apple-darwin
+          cargo build --release --target aarch64-apple-darwin
+
+      - name: Bundle .app
+        env:
+          VERSION: ${{ steps.version.outputs.value }}
+        run: |
+          # cargo-bundle reads [package.metadata.bundle] from Cargo.toml and
+          # generates Info.plist and the Resources/ layout for us. It only ever
+          # bundles one architecture, so we swap in a universal binary after.
+          cargo bundle --release --target aarch64-apple-darwin
+
+          APP="target/aarch64-apple-darwin/release/bundle/osx/Kintuba AFM Viewer.app"
+          lipo -create -output "${APP}/Contents/MacOS/${BIN_NAME}" \
+            "target/x86_64-apple-darwin/release/${BIN_NAME}" \
+            "target/aarch64-apple-darwin/release/${BIN_NAME}"
+          lipo -info "${APP}/Contents/MacOS/${BIN_NAME}"
+
+          # cargo-bundle takes the version from Cargo.toml; the tag is the real
+          # source of truth, so overwrite both version keys with it.
+          plutil -replace CFBundleVersion -string "${VERSION}" "${APP}/Contents/Info.plist"
+          plutil -replace CFBundleShortVersionString -string "${VERSION}" "${APP}/Contents/Info.plist"
+
+          # Sign AFTER replacing the binary -- doing it earlier would be undone by
+          # the lipo swap. Ad-hoc signing is the minimum Apple Silicon needs to
+          # launch the app at all; it is not notarisation.
+          codesign --force --deep --sign - "${APP}"
+          codesign --verify --verbose "${APP}"
+
+      - name: Build .dmg
+        env:
+          VERSION: ${{ steps.version.outputs.value }}
+        run: |
+          APP="target/aarch64-apple-darwin/release/bundle/osx/Kintuba AFM Viewer.app"
+          create-dmg \
+            --volname "Kintuba AFM Viewer" \
+            --window-size 500 300 \
+            --icon "Kintuba AFM Viewer.app" 130 130 \
+            --app-drop-link 350 130 \
+            "${APP_NAME}-${VERSION}-macos-universal.dmg" \
+            "${APP}"
+
+      - name: Stage artifacts
+        env:
+          VERSION: ${{ steps.version.outputs.value }}
+        run: |
+          APP="target/aarch64-apple-darwin/release/bundle/osx/Kintuba AFM Viewer.app"
+          mkdir -p out
+          mv "${APP_NAME}-${VERSION}-macos-universal.dmg" out/
+          cp "${APP}/Contents/MacOS/${BIN_NAME}" "out/${APP_NAME}-${VERSION}-macos-universal"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: macos
+          path: out/*
+          if-no-files-found: error
+
+  # ------------------------------------------------------------------ Linux --
+  linux:
+    name: Linux installers
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Derive version
+        id: version
+        run: |
+          if [ "$GITHUB_REF_TYPE" = "tag" ]; then
+            echo "value=${GITHUB_REF_NAME#v}" >> "$GITHUB_OUTPUT"
+          else
+            echo "value=0.0.0-dev" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            libxcb-render0-dev \
+            libxcb-shape0-dev \
+            libxcb-xfixes0-dev \
+            libxkbcommon-dev \
+            libwayland-dev \
+            libegl1-mesa-dev \
+            libgtk-3-dev \
+            libssl-dev \
+            desktop-file-utils \
+            file
+
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-deb
+
+      - name: Build
+        run: cargo build --release
+
+      - name: Build .deb
+        env:
+          VERSION: ${{ steps.version.outputs.value }}
+        # --deb-version keeps the package version in step with the git tag
+        # without having to rewrite Cargo.toml.
+        run: cargo deb --no-build --deb-version "${VERSION}"
+
+      - name: Build AppImage
+        env:
+          VERSION: ${{ steps.version.outputs.value }}
+        run: |
+          APPDIR=AppDir
+          mkdir -p "${APPDIR}/usr/bin" \
+                   "${APPDIR}/usr/share/applications" \
+                   "${APPDIR}/usr/share/icons/hicolor/512x512/apps"
+
+          cp "target/release/${BIN_NAME}" "${APPDIR}/usr/bin/"
+          cp installer/linux/AppRun "${APPDIR}/AppRun"
+          chmod +x "${APPDIR}/AppRun"
+
+          # appimagetool wants the .desktop and icon at the AppDir root as well
+          # as in their usual share/ locations.
+          cp "installer/linux/${APP_NAME}.desktop" "${APPDIR}/"
+          cp "installer/linux/${APP_NAME}.desktop" "${APPDIR}/usr/share/applications/"
+          cp assets/icon.png "${APPDIR}/${APP_NAME}.png"
+          cp assets/icon.png "${APPDIR}/usr/share/icons/hicolor/512x512/apps/${APP_NAME}.png"
+
+          desktop-file-validate "${APPDIR}/${APP_NAME}.desktop"
+
+          curl -fsSL -o appimagetool \
+            https://github.com/AppImage/appimagetool/releases/download/continuous/appimagetool-x86_64.AppImage
+          chmod +x appimagetool
+
+          # --appimage-extract-and-run avoids needing FUSE, which the runner lacks.
+          ARCH=x86_64 ./appimagetool --appimage-extract-and-run "${APPDIR}" \
+            "${APP_NAME}-${VERSION}-linux-x86_64.AppImage"
+
+      - name: Stage artifacts
+        env:
+          VERSION: ${{ steps.version.outputs.value }}
+        run: |
+          mkdir -p out
+          mv ./*.AppImage out/
+          cp target/debian/*.deb out/
+          cp "target/release/${BIN_NAME}" "out/${APP_NAME}-${VERSION}-linux-x86_64"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: linux
+          path: out/*
+          if-no-files-found: error
+
+  # ---------------------------------------------------------------- Release --
+  release:
+    name: Publish release
+    needs: [windows, macos, linux]
+    runs-on: ubuntu-latest
+    # Only tags produce a release; workflow_dispatch runs stop after building.
+    if: github.ref_type == 'tag'
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          merge-multiple: true
+
+      - name: List artifacts
+        run: ls -lh artifacts
+
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: artifacts/*
+          generate_release_notes: true
+          fail_on_unmatched_files: true

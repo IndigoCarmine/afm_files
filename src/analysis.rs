@@ -42,6 +42,7 @@ pub fn line_profile(image: &SpmImage, p0: (f32, f32), p1: (f32, f32)) -> Vec<(f3
     profile
 }
 
+#[allow(clippy::too_many_arguments)]
 pub fn export_afm_image(
     data: &[f32],
     rows: usize,
@@ -99,7 +100,10 @@ fn draw_scale_bar(img: &mut RgbaImage, scan_size_nm: f32) {
     let font = load_label_font();
     let px = (h as f32 * 0.06).max(11.0);
     let (text_w, text_h) = match &font {
-        Some(f) => (measure_text_ttf(&label, px, f).ceil() as u32, px.ceil() as u32),
+        Some(f) => (
+            measure_text_ttf(&label, px, f).ceil() as u32,
+            px.ceil() as u32,
+        ),
         None => (text_width(&label, s), 7 * s),
     };
 
@@ -267,7 +271,10 @@ pub fn export_profile_png(profile: &[(f32, f32)], path: &Path) -> Result<(), Str
     let x_min = profile.first().map(|p| p.0).unwrap_or(0.0);
     let x_max = profile.last().map(|p| p.0).unwrap_or(1.0);
     let y_min = profile.iter().map(|p| p.1).fold(f32::INFINITY, f32::min);
-    let y_max = profile.iter().map(|p| p.1).fold(f32::NEG_INFINITY, f32::max);
+    let y_max = profile
+        .iter()
+        .map(|p| p.1)
+        .fold(f32::NEG_INFINITY, f32::max);
     let x_range = (x_max - x_min).max(f32::EPSILON);
     let y_range = (y_max - y_min).max(f32::EPSILON);
 
@@ -397,7 +404,11 @@ fn ball_morph(g: &[f32], w: usize, h: usize, ball: &[(i32, i32, f32)], dilate: b
     let mut out = vec![0.0f32; w * h];
     for y in 0..h {
         for x in 0..w {
-            let mut acc = if dilate { f32::NEG_INFINITY } else { f32::INFINITY };
+            let mut acc = if dilate {
+                f32::NEG_INFINITY
+            } else {
+                f32::INFINITY
+            };
             for &(di, dj, bh) in ball {
                 let xx = (x as i32 + di).clamp(0, wi - 1) as usize;
                 let yy = (y as i32 + dj).clamp(0, hi - 1) as usize;
@@ -420,8 +431,16 @@ fn enlarge(small: &[f32], sw: usize, sh: usize, w: usize, h: usize) -> Vec<f32> 
         return small.to_vec();
     }
     let mut out = vec![0.0f32; w * h];
-    let sx = if w > 1 { (sw - 1) as f32 / (w - 1) as f32 } else { 0.0 };
-    let sy = if h > 1 { (sh - 1) as f32 / (h - 1) as f32 } else { 0.0 };
+    let sx = if w > 1 {
+        (sw - 1) as f32 / (w - 1) as f32
+    } else {
+        0.0
+    };
+    let sy = if h > 1 {
+        (sh - 1) as f32 / (h - 1) as f32
+    } else {
+        0.0
+    };
     for y in 0..h {
         let gy = y as f32 * sy;
         let y0 = gy.floor() as usize;
@@ -442,6 +461,28 @@ fn enlarge(small: &[f32], sw: usize, sh: usize, w: usize, h: usize) -> Vec<f32> 
         }
     }
     out
+}
+
+fn draw_line(
+    img: &mut ImageBuffer<Rgb<u8>, Vec<u8>>,
+    x0: i32,
+    y0: i32,
+    x1: i32,
+    y1: i32,
+    color: Rgb<u8>,
+) {
+    let (w, h) = (img.width() as i32, img.height() as i32);
+    let dx = (x1 - x0).abs();
+    let dy = (y1 - y0).abs();
+    let steps = dx.max(dy).max(1);
+    for i in 0..=steps {
+        let t = i as f32 / steps as f32;
+        let x = (x0 as f32 + t * (x1 - x0) as f32).round() as i32;
+        let y = (y0 as f32 + t * (y1 - y0) as f32).round() as i32;
+        if x >= 0 && y >= 0 && x < w && y < h {
+            img.put_pixel(x as u32, y as u32, color);
+        }
+    }
 }
 
 #[cfg(test)]
@@ -472,7 +513,11 @@ mod tests {
             }
         }
         let out = rolling_ball_subtract(&data, w, h, 10);
-        assert!(out[20 * w + 20] > 5.0, "feature preserved: {}", out[20 * w + 20]);
+        assert!(
+            out[20 * w + 20] > 5.0,
+            "feature preserved: {}",
+            out[20 * w + 20]
+        );
         assert!(out[0].abs() < 1.0, "background removed: {}", out[0]);
         assert!(out.iter().all(|&v| v.is_finite() && v >= -1e-3));
     }
@@ -494,7 +539,7 @@ mod tests {
         draw_scale_bar(&mut img, scan);
 
         let expected = ((200.0 / scan) * w as f32).round() as u32; // 40
-        // Longest solid-white horizontal run = the bar (wider than any glyph).
+                                                                   // Longest solid-white horizontal run = the bar (wider than any glyph).
         let mut best = 0u32;
         for y in 0..h {
             let mut run = 0u32;
@@ -518,20 +563,5 @@ mod tests {
         let mut img = RgbaImage::from_pixel(8, 8, Rgba([10, 20, 30, 255]));
         draw_scale_bar(&mut img, 1000.0);
         assert!(img.pixels().all(|p| p.0 == [10, 20, 30, 255]));
-    }
-}
-
-fn draw_line(img: &mut ImageBuffer<Rgb<u8>, Vec<u8>>, x0: i32, y0: i32, x1: i32, y1: i32, color: Rgb<u8>) {
-    let (w, h) = (img.width() as i32, img.height() as i32);
-    let dx = (x1 - x0).abs();
-    let dy = (y1 - y0).abs();
-    let steps = dx.max(dy).max(1);
-    for i in 0..=steps {
-        let t = i as f32 / steps as f32;
-        let x = (x0 as f32 + t * (x1 - x0) as f32).round() as i32;
-        let y = (y0 as f32 + t * (y1 - y0) as f32).round() as i32;
-        if x >= 0 && y >= 0 && x < w && y < h {
-            img.put_pixel(x as u32, y as u32, color);
-        }
     }
 }

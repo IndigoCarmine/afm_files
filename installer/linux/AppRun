@@ -1,0 +1,5 @@
+#!/bin/sh
+# AppImage entrypoint. Resolves the mounted AppDir at runtime and hands off to
+# the real binary, forwarding any arguments.
+HERE="$(dirname "$(readlink -f "$0")")"
+exec "${HERE}/usr/bin/afm_viewer" "$@"

@@ -10,6 +10,8 @@ struct ImageBlock {
 pub struct ChannelInfo {
     pub index: usize,
     pub name: String,
+    // Kept for debugging/display purposes even though nothing reads it yet.
+    #[allow(dead_code)]
     pub direction: String,
 }
 
@@ -110,7 +112,7 @@ fn parse_last_float(text: &str) -> Option<f32> {
                 .parse::<f32>()
                 .ok()
         })
-        .last()
+        .next_back()
 }
 
 fn parse_nm_per_lsb(
@@ -131,14 +133,16 @@ fn parse_nm_per_lsb(
     let v_per_lsb = parse_float_before_unit(z_scale_text, "V/LSB")
         .ok_or_else(|| format!("Could not parse V/LSB from Z scale: {z_scale_text}"))?;
 
-    let sens_name = parse_sensitivity_name(z_scale_text)
-        .ok_or_else(|| format!("Could not parse sensitivity reference from Z scale: {z_scale_text}"))?;
+    let sens_name = parse_sensitivity_name(z_scale_text).ok_or_else(|| {
+        format!("Could not parse sensitivity reference from Z scale: {z_scale_text}")
+    })?;
     let sens_key = format!("@Sens. {sens_name}");
     let sens_value = measurement_conditions
         .get(&sens_key)
         .ok_or_else(|| format!("Missing sensitivity field: {sens_key}"))?;
-    let nm_per_v = parse_float_before_unit(sens_value, "nm/V")
-        .ok_or_else(|| format!("Could not parse nm/V from sensitivity field {sens_key}: {sens_value}"))?;
+    let nm_per_v = parse_float_before_unit(sens_value, "nm/V").ok_or_else(|| {
+        format!("Could not parse nm/V from sensitivity field {sens_key}: {sens_value}")
+    })?;
 
     // Bruker convention: Z scale voltage represents the full peak-to-peak range across all
     // 256^bpp steps (unsigned integer range). For 16-bit: 65536 steps, so 1 LSB = z_scale_v / 65536.
@@ -192,11 +196,7 @@ fn list_channels_from_blocks(image_blocks: &[ImageBlock]) -> Vec<ChannelInfo> {
                         .then(|| extract_channel_name(v))
                 })
                 .unwrap_or_else(|| format!("Channel {i}"));
-            let direction = b
-                .fields
-                .get("Line Direction")
-                .cloned()
-                .unwrap_or_default();
+            let direction = b.fields.get("Line Direction").cloned().unwrap_or_default();
             ChannelInfo {
                 index: i,
                 name,
@@ -236,7 +236,6 @@ fn choose_image_block(
         .iter()
         .enumerate()
         .find(|(_, b)| has_required_fields(b))
-        .map(|(i, b)| (i, b))
         .ok_or_else(|| "No image block with required fields found".to_string())
 }
 
@@ -365,10 +364,13 @@ fn fit_polynomial(x: &[f32], y: &[f32], order: usize) -> Result<Vec<f32>, String
         }
     }
 
-    solve_linear_system(&mut a, &mut b)
-        .map(|coeffs| coeffs.into_iter().map(|v| v as f32).collect())
+    solve_linear_system(&mut a, &mut b).map(|coeffs| coeffs.into_iter().map(|v| v as f32).collect())
 }
 
+// Classic Gaussian elimination with partial pivoting: rows/columns are
+// cross-referenced by index (a[i][k], a[k][j], ...), so index-based loops
+// read more clearly here than clippy's iterator-based suggestions.
+#[allow(clippy::needless_range_loop)]
 fn solve_linear_system(a: &mut [Vec<f64>], b: &mut [f64]) -> Result<Vec<f64>, String> {
     let n = b.len();
     if a.len() != n || a.iter().any(|row| row.len() != n) {
@@ -446,10 +448,7 @@ fn parse_scan_size_nm(metadata: &HashMap<String, String>) -> f32 {
     };
 
     // Try to extract first number
-    let first_num: Option<f32> = raw
-        .split_whitespace()
-        .next()
-        .and_then(|s| s.parse().ok());
+    let first_num: Option<f32> = raw.split_whitespace().next().and_then(|s| s.parse().ok());
 
     let value = match first_num {
         Some(v) => v,
@@ -467,10 +466,13 @@ fn parse_scan_size_nm(metadata: &HashMap<String, String>) -> f32 {
 
 pub struct SpmImage {
     pub data: Vec<f32>, // flat row-major: data[row * samps_per_line + col]
+    // Kept for debugging/display purposes even though nothing reads them yet.
+    #[allow(dead_code)]
     pub metadata: HashMap<String, String>,
     pub scan_size_nm: f32,
     pub samps_per_line: usize,
     pub number_of_lines: usize,
+    #[allow(dead_code)]
     pub channel_name: String,
     pub channel_idx: usize,
     pub available_channels: Vec<ChannelInfo>,
@@ -577,7 +579,9 @@ fn coordinate_read<R>(path: &Path, accessor: impl FnOnce(&Path) -> R) -> Result<
     );
     if let Some(err) = out_error {
         let desc = err.localizedDescription();
-        return Err(format!("クラウドストレージからの読み込みに失敗しました: {desc}"));
+        return Err(format!(
+            "クラウドストレージからの読み込みに失敗しました: {desc}"
+        ));
     }
 
     result.take().ok_or_else(|| {
@@ -656,16 +660,12 @@ pub fn load_spm(
         .map(|c| c.name.clone())
         .unwrap_or_else(|| format!("Channel {loaded_idx}"));
 
-    let data_offset =
-        parse_usize_field(image_block.fields.get("Data offset"), "Data offset")?;
-    let data_length =
-        parse_usize_field(image_block.fields.get("Data length"), "Data length")?;
-    let samps_per_line =
-        parse_usize_field(image_block.fields.get("Samps/line"), "Samps/line")?;
+    let data_offset = parse_usize_field(image_block.fields.get("Data offset"), "Data offset")?;
+    let data_length = parse_usize_field(image_block.fields.get("Data length"), "Data length")?;
+    let samps_per_line = parse_usize_field(image_block.fields.get("Samps/line"), "Samps/line")?;
     let number_of_lines =
         parse_usize_field(image_block.fields.get("Number of lines"), "Number of lines")?;
-    let bytes_per_pixel =
-        parse_usize_field(image_block.fields.get("Bytes/pixel"), "Bytes/pixel")?;
+    let bytes_per_pixel = parse_usize_field(image_block.fields.get("Bytes/pixel"), "Bytes/pixel")?;
 
     let end_offset = data_offset
         .checked_add(data_length)

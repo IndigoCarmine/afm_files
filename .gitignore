@@ -1,2 +1,10 @@
 /target
 /test_data
+/dist
+
+# Release-workflow scratch output (also produced when building installers locally)
+/out
+/AppDir
+*.AppImage
+*.dmg
+*.deb

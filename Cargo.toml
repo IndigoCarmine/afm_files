@@ -63,3 +63,28 @@ objc2-foundation  = { version = "0.3", features = [
 
 [build-dependencies]
 winresource = "0.1"
+
+# Release binaries: smaller and faster, at the cost of longer link times.
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+strip = true
+
+# --- cargo-deb: used by .github/workflows/release.yml to build the Linux .deb ---
+[package.metadata.deb]
+name = "kintuba-afm-viewer"
+maintainer = "Yuhei Yamada"
+copyright = "Copyright (c) Yuhei Yamada 2026. All rights reserved."
+extended-description = "A desktop application for viewing and analyzing Bruker Nanoscope SPM files (.spm)."
+section = "science"
+priority = "optional"
+# eframe dlopens its GL/X11/Wayland libraries rather than linking them, so `$auto`
+# only ever detects libc. Without listing them the package installs cleanly and
+# then fails to start on a minimal system.
+depends = "$auto, libxkbcommon0, libwayland-client0, libegl1, libgl1, libx11-6, libxcursor1, libxi6, libxrandr2"
+assets = [
+    ["target/release/afm_viewer", "usr/bin/", "755"],
+    ["installer/linux/kintuba-afm-viewer.desktop", "usr/share/applications/", "644"],
+    ["assets/icon.png", "usr/share/icons/hicolor/512x512/apps/kintuba-afm-viewer.png", "644"],
+]
