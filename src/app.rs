@@ -1,5 +1,6 @@
 use crate::analysis::{export_afm_image, export_csv, export_profile_png, line_profile, nice_scale};
 use crate::colormap::{to_color_image, to_rgba_bytes, Colormap};
+use crate::name_filter::NameFilter;
 use crate::parser::{load_spm, ChannelInfo, SpmImage};
 use crate::view3d::{OrbitalCamera, SurfaceRenderer};
 use egui::{TextureHandle, TextureOptions, Vec2};
@@ -27,6 +28,7 @@ pub struct AfmViewerApp {
     folder: Option<PathBuf>,
     files: Vec<PathBuf>,
     selected: Option<usize>,
+    name_filter: String,
 
     // Loaded image state
     image: Option<SpmImage>,
@@ -98,6 +100,7 @@ impl Default for AfmViewerApp {
             folder: None,
             files: vec![],
             selected: None,
+            name_filter: String::new(),
             image: None,
             texture: None,
             load_error: None,
@@ -172,6 +175,24 @@ fn image_origin(rect: egui::Rect, zoom: f32, pan: Vec2) -> egui::Pos2 {
     let cx = rect.center().x + pan.x - rect.width() * zoom * 0.5;
     let cy = rect.center().y + pan.y - rect.height() * zoom * 0.5;
     egui::pos2(cx, cy)
+}
+
+const FILTER_HELP: &str = "\
+Filter by file name (case-insensitive, extension included).
+
+  *    any text not crossing '_'
+  **   any text, '_' included
+  {<20260808}             numeric compare: < <= > >= = !=
+  {>=20260101,<20260808}  comma = AND
+  {EtOH|MeOH}             one of these
+
+Text without * or { is a plain substring search.
+Example: {<20260808}_*_*_*_EtOH10_**";
+
+fn file_name_of(path: &std::path::Path) -> String {
+    path.file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_default()
 }
 
 fn is_spm_file(path: &std::path::Path) -> bool {
@@ -505,26 +526,93 @@ impl AfmViewerApp {
     }
 
     fn show_file_list(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
+        if self.files.is_empty() {
+            ui.label("No SPM files found.");
+            return;
+        }
+
+        // Filter box: kept outside the scroll area so it stays visible.
+        //
+        // The clear button is placed first in a right-to-left layout so the
+        // text field can claim exactly the space that is left over. A row that
+        // is even a few pixels too wide grows the whole panel — the panel takes
+        // the size of its contents — which drags the divider rightwards a bit
+        // more on every frame.
+        ui.horizontal(|ui| {
+            ui.label("🔍");
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                let clearable = !self.name_filter.is_empty();
+                if ui
+                    .add_enabled(clearable, egui::Button::new("✖").small())
+                    .on_hover_text("Clear the filter")
+                    .clicked()
+                {
+                    self.name_filter.clear();
+                }
+                let width = ui.available_width();
+                ui.add(
+                    egui::TextEdit::singleline(&mut self.name_filter)
+                        .hint_text("filter…")
+                        .desired_width(width),
+                )
+                .on_hover_text(FILTER_HELP);
+            });
+        });
+
+        // An unfinished pattern shouldn't blank the list while it is typed, so
+        // a parse error is reported and treated as "no filter".
+        let filter = match NameFilter::parse(&self.name_filter) {
+            Ok(f) => f,
+            Err(e) => {
+                ui.colored_label(egui::Color32::RED, e);
+                None
+            }
+        };
+
+        // Indices into `self.files`: `selected` and `load_file` are defined in
+        // terms of those, so filtering must never renumber the list.
+        let visible: Vec<usize> = self
+            .files
+            .iter()
+            .enumerate()
+            .filter(|(_, path)| match &filter {
+                Some(f) => f.matches(&file_name_of(path)),
+                None => true,
+            })
+            .map(|(i, _)| i)
+            .collect();
+        if filter.is_some() {
+            ui.small(format!("{} / {} files", visible.len(), self.files.len()));
+        }
+        ui.add_space(2.0);
+
+        let mut to_load: Option<usize> = None;
+        let mut to_copy: Option<String> = None;
         egui::ScrollArea::vertical().show(ui, |ui| {
-            if self.files.is_empty() {
-                ui.label("No SPM files found.");
+            if visible.is_empty() {
+                ui.label("No files match the filter.");
                 return;
             }
-            let mut to_load: Option<usize> = None;
-            for (i, path) in self.files.iter().enumerate() {
-                let name = path
-                    .file_name()
-                    .map(|n| n.to_string_lossy())
-                    .unwrap_or_default();
+            for i in visible {
+                let name = file_name_of(&self.files[i]);
                 let selected = self.selected == Some(i);
-                if ui.selectable_label(selected, name.as_ref()).clicked() && !selected {
+                let resp = ui
+                    .selectable_label(selected, &name)
+                    .on_hover_text("Double-click to copy the file name");
+                if resp.double_clicked() {
+                    to_copy = Some(name);
+                } else if resp.clicked() && !selected {
                     to_load = Some(i);
                 }
             }
-            if let Some(idx) = to_load {
-                self.load_file(ctx, idx);
-            }
         });
+        if let Some(name) = to_copy {
+            ctx.copy_text(name.clone());
+            self.status_msg = format!("Copied file name: {name}");
+        }
+        if let Some(idx) = to_load {
+            self.load_file(ctx, idx);
+        }
     }
 
     // ── View tab ──────────────────────────────────────────────────────────────
@@ -1471,5 +1559,52 @@ impl eframe::App for AfmViewerApp {
         if let (Some(gl), Some(renderer)) = (gl, &self.renderer) {
             renderer.lock().unwrap().destroy(gl);
         }
+    }
+}
+
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A panel takes the size of its contents, so a filter row that is even a
+    /// few pixels too wide pushes the divider further right on *every* frame.
+    #[test]
+    #[allow(deprecated)] // `Panel::show` — same as in `update`.
+    fn filter_row_does_not_widen_the_file_panel() {
+        let ctx = egui::Context::default();
+        let mut app = AfmViewerApp {
+            files: (0..5)
+                .map(|i| PathBuf::from(format!("20260101_sampleA_p1_run3_EtOH10_{i}.003")))
+                .collect(),
+            name_filter: "{<20260808}_*_*_*_EtOH10_**".to_string(),
+            ..Default::default()
+        };
+
+        let widths: Vec<f32> = (0..4)
+            .map(|_| {
+                let input = egui::RawInput {
+                    screen_rect: Some(egui::Rect::from_min_size(
+                        egui::Pos2::ZERO,
+                        egui::vec2(1200.0, 800.0),
+                    )),
+                    ..Default::default()
+                };
+                let _ = ctx.run(input, |ctx| {
+                    egui::Panel::left("file_panel").min_size(200.0).show(ctx, |ui| {
+                        app.show_file_list(ui, ctx);
+                    });
+                });
+                egui::containers::PanelState::load(&ctx, egui::Id::new("file_panel"))
+                    .expect("panel was shown")
+                    .rect
+                    .width()
+            })
+            .collect();
+
+        assert!(
+            widths[1..].iter().all(|w| *w == widths[1]),
+            "file panel width drifted across frames: {widths:?}"
+        );
     }
 }

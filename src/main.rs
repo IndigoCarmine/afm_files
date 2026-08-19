@@ -2,6 +2,7 @@
 mod analysis;
 mod app;
 mod colormap;
+mod name_filter;
 mod parser;
 mod view3d;
 

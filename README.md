@@ -5,6 +5,8 @@ A desktop application for viewing and analyzing Bruker Nanoscope SPM files (`.sp
 ## Features
 
 - **File browser** — Open a folder and list all Nanoscope SPM files (`.spm`, `.000`–`.009`, etc.)
+  - Name filter with `_`-aware wildcards (see [File name filter](#file-name-filter))
+  - Double-click a file to copy its name to the clipboard
 - **Height map display** — Renders the AFM height channel as a color image
   - Colormaps: AFM Hot, Gray, Viridis
   - Z-range controls (drag values, extendable beyond data min/max)
@@ -53,6 +55,29 @@ Requires Rust 2021 edition or later.
 4. Switch to the **Analysis** tab to draw a line profile.
 5. Click the profile plot to place markers A and B; the ΔD and ΔH values appear below the plot.
 6. Use **Save CSV** or **Save PNG** to export the profile data.
+
+### File name filter
+
+The box above the file list narrows it down. Matching is done against the whole
+file name (extension included) and ignores case.
+
+| Pattern | Meaning |
+|---------|---------|
+| `*` | any text that does **not** cross a `_` |
+| `**` | any text, `_` included |
+| `{<20260808}` | numeric comparison on the digits at that position — `<` `<=` `>` `>=` `=` `!=` |
+| `{>=20260101,<20260808}` | comma-separated conditions are ANDed |
+| `{EtOH|MeOH}` | one of the listed alternatives |
+
+Text containing no `*` and no `{` is a plain substring search, so typing `EtOH`
+is enough for a quick lookup.
+
+```
+{<20260808}_*_*_*_EtOH10_**
+```
+
+matches `20260101_sampleA_p1_run3_EtOH10_scan.003` — a date before 2026-08-08,
+three arbitrary segments, the literal `EtOH10`, then anything.
 
 ## License
 
