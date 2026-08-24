@@ -472,9 +472,15 @@ fn build_mesh(
         return (Vec::new(), Vec::new());
     }
 
+    // The longer lateral axis spans SPAN; the shorter one is scaled down by the
+    // true size ratio so a non-square (or XY-calibrated) scan is not rendered
+    // as a square patch.
     const SPAN: f32 = 2.0;
-    let dx = SPAN / (w - 1) as f32;
-    let dz = SPAN / (h - 1) as f32;
+    let longest = img.scan_size_x_nm.max(img.scan_size_y_nm).max(f32::EPSILON);
+    let span_x = SPAN * (img.scan_size_x_nm / longest).clamp(f32::EPSILON, 1.0);
+    let span_z = SPAN * (img.scan_size_y_nm / longest).clamp(f32::EPSILON, 1.0);
+    let dx = span_x / (w - 1) as f32;
+    let dz = span_z / (h - 1) as f32;
 
     let geo_min = img.data.iter().cloned().fold(f32::INFINITY, f32::min);
     let geo_max = img.data.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
@@ -490,8 +496,8 @@ fn build_mesh(
     let mut verts = Vec::with_capacity(w * h);
     for row in 0..h {
         for col in 0..w {
-            let x = (col as f32 / (w - 1) as f32 - 0.5) * SPAN;
-            let z = (row as f32 / (h - 1) as f32 - 0.5) * SPAN;
+            let x = (col as f32 / (w - 1) as f32 - 0.5) * span_x;
+            let z = (row as f32 / (h - 1) as f32 - 0.5) * span_z;
             let y = height(row, col);
 
             // Central differences (clamped at edges) → surface normal for y=f(x,z).
@@ -537,12 +543,15 @@ mod tests {
         SpmImage {
             data: (0..w * h).map(|i| i as f32).collect(),
             metadata: HashMap::new(),
-            scan_size_nm: 1000.0,
+            scan_size_x_nm: 1000.0,
+            scan_size_y_nm: 1000.0,
             samps_per_line: w,
             number_of_lines: h,
             channel_name: "Height".into(),
             channel_idx: 0,
             available_channels: Vec::new(),
+            instrument_id: None,
+            calibration: crate::calibration::Calibration::UNITY,
         }
     }
 
@@ -558,6 +567,30 @@ mod tests {
             assert!(v.normal.iter().all(|c| c.is_finite()));
             assert!(v.color.iter().all(|&c| (0.0..=1.0).contains(&c)));
         }
+    }
+
+    #[test]
+    fn mesh_span_follows_the_true_lateral_extents() {
+        let mut img = dummy_image(4, 4);
+        // Y is half of X, so the mesh should be half as deep as it is wide.
+        img.scan_size_x_nm = 1000.0;
+        img.scan_size_y_nm = 500.0;
+        let (verts, _) = build_mesh(&img, Colormap::Gray, 0.0, 15.0, 1.0);
+
+        let extent = |axis: usize| {
+            let lo = verts
+                .iter()
+                .map(|v| v.pos[axis])
+                .fold(f32::INFINITY, f32::min);
+            let hi = verts
+                .iter()
+                .map(|v| v.pos[axis])
+                .fold(f32::NEG_INFINITY, f32::max);
+            hi - lo
+        };
+        // The longer axis spans SPAN = 2.0; the shorter one is scaled to match.
+        assert!((extent(0) - 2.0).abs() < 1e-4, "x span: {}", extent(0));
+        assert!((extent(2) - 1.0).abs() < 1e-4, "z span: {}", extent(2));
     }
 
     #[test]

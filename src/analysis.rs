@@ -9,8 +9,8 @@ use std::path::Path;
 pub fn line_profile(image: &SpmImage, p0: (f32, f32), p1: (f32, f32)) -> Vec<(f32, f32)> {
     let rows = image.number_of_lines;
     let cols = image.samps_per_line;
-    let nm_per_px_x = image.scan_size_nm / cols as f32;
-    let nm_per_px_y = image.scan_size_nm / rows as f32;
+    let nm_per_px_x = image.scan_size_x_nm / cols as f32;
+    let nm_per_px_y = image.scan_size_y_nm / rows as f32;
 
     let x0 = p0.0 * cols as f32;
     let y0 = p0.1 * rows as f32;
@@ -42,6 +42,25 @@ pub fn line_profile(image: &SpmImage, p0: (f32, f32), p1: (f32, f32)) -> Vec<(f3
     profile
 }
 
+/// How far a raw pixel grid departs from the sample's true X:Y aspect: the
+/// factor its height would have to be multiplied by to be geometrically
+/// faithful. `None` when the grid is already within 0.1% of correct.
+///
+/// Exported and copied images keep their raw pixel grid — resampling would put
+/// interpolated pixels into a file meant to hold measurements — so callers use
+/// this to warn that the saved image still carries the distortion.
+pub fn aspect_error(cols: usize, rows: usize, scan_x_nm: f32, scan_y_nm: f32) -> Option<f32> {
+    if cols == 0 || rows == 0 || !scan_x_nm.is_finite() || !scan_y_nm.is_finite() {
+        return None;
+    }
+    if scan_x_nm <= 0.0 || scan_y_nm <= 0.0 {
+        return None;
+    }
+    // True height:width against the height:width the pixel grid actually shows.
+    let factor = (scan_y_nm / scan_x_nm) / (rows as f32 / cols as f32);
+    ((factor - 1.0).abs() >= 0.001).then_some(factor)
+}
+
 #[allow(clippy::too_many_arguments)]
 pub fn export_afm_image(
     data: &[f32],
@@ -50,15 +69,19 @@ pub fn export_afm_image(
     cmap: Colormap,
     z_min: f32,
     z_max: f32,
-    scan_size_nm: f32,
+    scan_size_x_nm: f32,
     scale_bar: bool,
     path: &Path,
 ) -> Result<(), String> {
+    // The raw pixel grid is written as-is — never resampled to the corrected
+    // aspect — so the file keeps the measured samples. Only the scale bar is
+    // derived from the (possibly calibrated) X extent, which stays correct
+    // because it is measured along the image width.
     let rgba = to_rgba_bytes(data, rows, cols, cmap, z_min, z_max);
     let mut img: RgbaImage = ImageBuffer::from_raw(cols as u32, rows as u32, rgba)
         .ok_or_else(|| "Failed to create image buffer".to_string())?;
     if scale_bar {
-        draw_scale_bar(&mut img, scan_size_nm);
+        draw_scale_bar(&mut img, scan_size_x_nm);
     }
     img.save(path)
         .map_err(|e| format!("Failed to save image: {e}"))
@@ -549,6 +572,62 @@ mod tests {
         let data = vec![3.0f32; 16];
         let (lo, hi) = judge_display_range(&data, 3.0, 3.0);
         assert_eq!((lo, hi), (3.0, 3.0));
+    }
+
+    #[test]
+    fn aspect_error_is_none_when_the_grid_is_already_faithful() {
+        // Square scan on a square grid.
+        assert_eq!(aspect_error(512, 512, 5000.0, 5000.0), None);
+        // Anisotropic scan already matched by the pixel grid.
+        assert_eq!(aspect_error(512, 256, 5000.0, 2500.0), None);
+        // Within the 0.1% tolerance: not worth warning about.
+        assert_eq!(aspect_error(512, 512, 5000.0, 4998.0), None);
+        // Degenerate inputs never warn.
+        assert_eq!(aspect_error(512, 512, 0.0, 5000.0), None);
+        assert_eq!(aspect_error(0, 0, 5000.0, 2500.0), None);
+    }
+
+    #[test]
+    fn aspect_error_reports_the_missing_height_factor() {
+        // Y is 30% longer than the square grid shows: height is short by 1.3x.
+        let f = aspect_error(512, 512, 1000.0, 1300.0).expect("distorted");
+        assert!((f - 1.3).abs() < 1e-4, "{f}");
+        // X longer instead: the height is proportionally too large.
+        let f = aspect_error(512, 512, 1300.0, 1000.0).expect("distorted");
+        assert!((f - 1.0 / 1.3).abs() < 1e-4, "{f}");
+        // A 2:1 scan squeezed onto a square grid.
+        let f = aspect_error(512, 512, 5000.0, 2500.0).expect("distorted");
+        assert!((f - 0.5).abs() < 1e-4, "{f}");
+    }
+
+    #[test]
+    fn export_writes_the_raw_pixel_grid_even_when_the_aspect_is_wrong() {
+        let (cols, rows) = (16, 16);
+        let data: Vec<f32> = (0..cols * rows).map(|i| i as f32).collect();
+        let path = std::env::temp_dir().join("kintuba_export_raw_test.png");
+
+        // Y extent 30% larger than the square grid shows: the file must still
+        // come out 16x16, never resampled to the corrected aspect.
+        export_afm_image(
+            &data,
+            rows,
+            cols,
+            Colormap::Gray,
+            0.0,
+            255.0,
+            1000.0,
+            false,
+            &path,
+        )
+        .expect("export should succeed");
+
+        let written = image::open(&path).expect("written png should open");
+        let _ = std::fs::remove_file(&path);
+        assert_eq!(
+            (written.width(), written.height()),
+            (cols as u32, rows as u32),
+            "export must preserve the raw pixel grid"
+        );
     }
 
     #[test]

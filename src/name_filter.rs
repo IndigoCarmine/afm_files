@@ -214,7 +214,10 @@ fn match_tokens(tokens: &[Token], s: &[char]) -> bool {
         Token::Brace(Brace::Num(conds)) => {
             // The whole run of digits is one token: `{<100}` must not match the
             // leading `2` of `20260808`.
-            let digits = s.iter().position(|c| !c.is_ascii_digit()).unwrap_or(s.len());
+            let digits = s
+                .iter()
+                .position(|c| !c.is_ascii_digit())
+                .unwrap_or(s.len());
             if digits == 0 {
                 return false;
             }

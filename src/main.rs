@@ -1,11 +1,15 @@
 #![windows_subsystem = "windows"]
 mod analysis;
 mod app;
+mod calibration;
 mod colormap;
 mod name_filter;
 mod parser;
 mod view3d;
 
+/// Add a CJK face to the font stack. The UI itself is English, but file names
+/// and paths are not: without this, a Japanese name in the file list renders as
+/// a row of tofu.
 fn setup_fonts(ctx: &egui::Context) {
     #[cfg(target_os = "windows")]
     let font_path = r"C:\Windows\Fonts\NotoSansJP-VF.ttf";

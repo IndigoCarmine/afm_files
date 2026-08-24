@@ -1,4 +1,7 @@
-use crate::analysis::{export_afm_image, export_csv, export_profile_png, line_profile, nice_scale};
+use crate::analysis::{
+    aspect_error, export_afm_image, export_csv, export_profile_png, line_profile, nice_scale,
+};
+use crate::calibration::{Calibration, CalibrationTable};
 use crate::colormap::{to_color_image, to_rgba_bytes, Colormap};
 use crate::name_filter::NameFilter;
 use crate::parser::{load_spm, ChannelInfo, SpmImage};
@@ -53,6 +56,13 @@ pub struct AfmViewerApp {
     // Export options
     show_scale_bar: bool,
 
+    // Per-instrument XY calibration. `calibration` is what is applied to loaded
+    // images; `calibration_draft` holds the dialog's unsaved edits while it is
+    // open, so abandoning them cannot change how the next file is scaled.
+    calibration: CalibrationTable,
+    calibration_draft: Option<CalibrationTable>,
+    show_calibration_window: bool,
+
     // Tab
     tab: Tab,
 
@@ -66,6 +76,8 @@ pub struct AfmViewerApp {
     drag_target: Option<u8>, // 0=p0, 1=p1
     profile: Vec<(f32, f32)>,
     status_msg: String,
+    /// Render `status_msg` as a warning rather than plain text.
+    status_warn: bool,
 
     // Profile plot markers (distance in nm)
     plot_marker_a: Option<f64>,
@@ -91,7 +103,7 @@ pub struct AfmViewerApp {
     // 3D image export: a requested save path is consumed by the paint callback
     // (where the GL context is current); the outcome is reported back here.
     export_request: Option<PathBuf>,
-    export_status: Arc<Mutex<Option<String>>>,
+    export_status: Arc<Mutex<Option<(String, bool)>>>,
 }
 
 impl Default for AfmViewerApp {
@@ -116,6 +128,11 @@ impl Default for AfmViewerApp {
             z_data_min: 0.0,
             z_data_max: 1.0,
             show_scale_bar: true,
+            // Loading from disk belongs in `new`, not here: tests construct the
+            // app via `Default` and must not touch the user's config file.
+            calibration: CalibrationTable::default(),
+            calibration_draft: None,
+            show_calibration_window: false,
             tab: Tab::View,
             zoom: 1.0,
             pan: Vec2::ZERO,
@@ -124,6 +141,7 @@ impl Default for AfmViewerApp {
             drag_target: None,
             profile: vec![],
             status_msg: String::new(),
+            status_warn: false,
             plot_marker_a: None,
             plot_marker_b: None,
             profile_filter: ProfileFilter::None,
@@ -149,6 +167,7 @@ impl AfmViewerApp {
         Self {
             // Available when eframe runs on the glow backend (the default).
             gl: cc.gl.clone(),
+            calibration: CalibrationTable::load(),
             ..Self::default()
         }
     }
@@ -177,6 +196,14 @@ fn image_origin(rect: egui::Rect, zoom: f32, pan: Vec2) -> egui::Pos2 {
     egui::pos2(cx, cy)
 }
 
+/// The app's warning red, shared with the profile-plot markers.
+const WARN_RED: egui::Color32 = egui::Color32::from_rgb(220, 60, 60);
+
+/// Title of the calibration dialog. egui derives the window's `Id` from it, and
+/// the tests look the window up by that `Id`, so both sides read it from here
+/// rather than repeating the string and drifting apart.
+const CALIBRATION_WINDOW_TITLE: &str = "Calibration";
+
 const FILTER_HELP: &str = "\
 Filter by file name (case-insensitive, extension included).
 
@@ -188,6 +215,12 @@ Filter by file name (case-insensitive, extension included).
 
 Text without * or { is a plain substring search.
 Example: {<20260808}_*_*_*_EtOH10_**";
+
+const CALIBRATION_HELP: &str = "Set the XY scale factors for each instrument.
+
+Keyed on the Serial Number line in the file header, the factors are
+applied to the scan extents of every image opened. While anything
+other than 1.0 is in effect the image is framed in red.";
 
 fn file_name_of(path: &std::path::Path) -> String {
     path.file_name()
@@ -322,6 +355,116 @@ impl AfmViewerApp {
         self.analysis_texture_dirty = false;
     }
 
+    /// The non-unity calibration currently folded into the loaded image, or
+    /// `None` when the header values are being used as-is.
+    fn active_calibration(&self) -> Option<Calibration> {
+        self.image
+            .as_ref()
+            .map(|i| i.calibration)
+            .filter(|c| !c.is_unity())
+    }
+
+    /// Stroke for the frame around the image. Turns red and thickens while an
+    /// instrument calibration is in effect, so a silently rescaled image is
+    /// never mistaken for raw data.
+    fn image_frame_stroke(&self, normal: egui::Stroke) -> egui::Stroke {
+        match self.active_calibration() {
+            Some(_) => egui::Stroke::new(normal.width.max(3.0), WARN_RED),
+            None => normal,
+        }
+    }
+
+    /// Largest size with the sample's true X:Y aspect that fits in a
+    /// `side` x `side` box. Falls back to a square when no image is loaded or
+    /// the extents are degenerate.
+    fn image_display_size(&self, side: f32) -> Vec2 {
+        let side = side.max(1.0);
+        let aspect = self
+            .image
+            .as_ref()
+            .map(|i| i.scan_size_x_nm / i.scan_size_y_nm)
+            .filter(|a| a.is_finite() && *a > 0.0)
+            .unwrap_or(1.0);
+        if aspect >= 1.0 {
+            Vec2::new(side, side / aspect)
+        } else {
+            Vec2::new(side * aspect, side)
+        }
+    }
+
+    /// Set the status line, flagging whether it should read as a warning.
+    fn set_status(&mut self, (msg, warn): (String, bool)) {
+        self.status_msg = msg;
+        self.status_warn = warn;
+    }
+
+    /// Render the status line, in the warning colour when it is one. Wrapped,
+    /// because an export note naming the pixel size and the missing factor is
+    /// easily wider than the panel.
+    fn show_status(&self, ui: &mut egui::Ui) {
+        if self.status_msg.is_empty() {
+            return;
+        }
+        let text = egui::RichText::new(&self.status_msg);
+        let text = if self.status_warn {
+            text.color(WARN_RED)
+        } else {
+            text
+        };
+        ui.add(egui::Label::new(text).wrap());
+    }
+
+    /// Note to show after writing or copying an image. Saved images keep the
+    /// raw pixel grid, so when that grid does not carry the sample's true
+    /// aspect the result is a warning naming the factor that is missing.
+    fn raw_export_note(done: &str, img: &SpmImage) -> (String, bool) {
+        match aspect_error(
+            img.samps_per_line,
+            img.number_of_lines,
+            img.scan_size_x_nm,
+            img.scan_size_y_nm,
+        ) {
+            Some(f) => (
+                format!(
+                    "{done} ⚠ Raw (uncorrected): {}x{} px — scale height ×{f:.4} for the true aspect",
+                    img.samps_per_line, img.number_of_lines
+                ),
+                true,
+            ),
+            None => (done.to_string(), false),
+        }
+    }
+
+    /// Standing warning shown next to the save/copy buttons, so the mismatch is
+    /// visible before the image is written rather than only after.
+    fn raw_export_warning(&self) -> Option<String> {
+        let img = self.image.as_ref()?;
+        let f = aspect_error(
+            img.samps_per_line,
+            img.number_of_lines,
+            img.scan_size_x_nm,
+            img.scan_size_y_nm,
+        )?;
+        Some(format!(
+            "⚠ Save/copy is raw — scale height ×{f:.4} for the true aspect"
+        ))
+    }
+
+    /// One-line summary of the calibration in effect, for the warning label and
+    /// the settings dialog.
+    fn calibration_summary(&self) -> Option<String> {
+        let c = self.active_calibration()?;
+        let id = self
+            .image
+            .as_ref()
+            .and_then(|i| i.instrument_id.clone())
+            .unwrap_or_else(|| "?".to_string());
+        Some(format!(
+            "Calibration applied: {id}  X×{:.4} / Y×{:.4} / Z×{:.4}",
+            c.x, c.y, c.z
+        ))
+    }
+
     fn load_file(&mut self, ctx: &egui::Context, idx: usize) {
         self.load_file_channel(ctx, idx, None);
     }
@@ -365,6 +508,11 @@ impl AfmViewerApp {
                         img.number_of_lines,
                         self.rolling_ball_radius as usize,
                     );
+                }
+                // Undo the instrument's lateral distortion before anything
+                // reads the scan extents.
+                if let Some(id) = img.instrument_id.clone() {
+                    img.apply_calibration(self.calibration.get(&id));
                 }
                 let z_min = img.data.iter().cloned().fold(f32::INFINITY, f32::min);
                 let z_max = img.data.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
@@ -522,6 +670,17 @@ impl AfmViewerApp {
                 self.zoom = 1.0;
                 self.pan = Vec2::ZERO;
             }
+
+            ui.separator();
+
+            let cal_button = ui.button("⚙ Calibration");
+            if cal_button.clicked() {
+                self.show_calibration_window = !self.show_calibration_window;
+            }
+            cal_button.on_hover_text(CALIBRATION_HELP);
+            if let Some(msg) = self.calibration_summary() {
+                ui.colored_label(WARN_RED, msg);
+            }
         });
     }
 
@@ -608,7 +767,7 @@ impl AfmViewerApp {
         });
         if let Some(name) = to_copy {
             ctx.copy_text(name.clone());
-            self.status_msg = format!("Copied file name: {name}");
+            self.set_status((format!("Copied file name: {name}"), false));
         }
         if let Some(idx) = to_load {
             self.load_file(ctx, idx);
@@ -625,6 +784,10 @@ impl AfmViewerApp {
         if self.texture.is_none() {
             ui.label("Select a file to view.");
             return;
+        }
+
+        if let Some(msg) = self.calibration_summary() {
+            ui.colored_label(WARN_RED, msg);
         }
 
         // Z range — DragValue allows values outside the data min/max
@@ -650,7 +813,7 @@ impl AfmViewerApp {
             if (self.z_max - prev).abs() > f32::EPSILON {
                 z_changed = true;
             }
-            if ui.button("データ範囲").clicked() {
+            if ui.button("Data Range").clicked() {
                 self.z_min = self.z_data_min;
                 self.z_max = self.z_data_max;
                 z_changed = true;
@@ -685,12 +848,12 @@ impl AfmViewerApp {
                             self.colormap,
                             self.z_min,
                             self.z_max,
-                            img.scan_size_nm,
+                            img.scan_size_x_nm,
                             self.show_scale_bar,
                             &path,
                         ) {
-                            Ok(_) => self.status_msg = "Image saved.".to_string(),
-                            Err(e) => self.status_msg = format!("Save error: {e}"),
+                            Ok(_) => self.set_status(Self::raw_export_note("Image saved.", img)),
+                            Err(e) => self.set_status((format!("Save error: {e}"), true)),
                         }
                     }
                 }
@@ -713,24 +876,26 @@ impl AfmViewerApp {
                                 bytes: std::borrow::Cow::Owned(rgba),
                             };
                             match cb.set_image(img_data) {
-                                Ok(_) => self.status_msg = "Copied to clipboard.".to_string(),
-                                Err(e) => self.status_msg = format!("Clipboard error: {e}"),
+                                Ok(_) => self
+                                    .set_status(Self::raw_export_note("Copied to clipboard.", img)),
+                                Err(e) => self.set_status((format!("Clipboard error: {e}"), true)),
                             }
                         }
-                        Err(e) => self.status_msg = format!("Clipboard error: {e}"),
+                        Err(e) => self.set_status((format!("Clipboard error: {e}"), true)),
                     }
                 }
             }
-            if !self.status_msg.is_empty() {
-                ui.label(self.status_msg.clone());
+            if let Some(warn) = self.raw_export_warning() {
+                ui.colored_label(WARN_RED, warn);
             }
         });
+        self.show_status(ui);
 
         let avail = ui.available_size();
         let base_side = avail.x.min(avail.y) - 20.0;
 
         let (response, painter) = ui.allocate_painter(
-            Vec2::new(base_side, base_side),
+            self.image_display_size(base_side),
             egui::Sense::click_and_drag(),
         );
         let rect = response.rect;
@@ -767,18 +932,18 @@ impl AfmViewerApp {
             );
         }
 
-        // Border around image area
+        // Border around image area — red while an XY calibration is applied.
         painter.rect_stroke(
             rect,
             0.0,
-            egui::Stroke::new(1.0_f32, egui::Color32::BLACK),
+            self.image_frame_stroke(egui::Stroke::new(1.0_f32, egui::Color32::BLACK)),
             egui::StrokeKind::Inside,
         );
 
         // Scale bar
         if let Some(ref img) = self.image {
-            let bar_nm = nice_scale(img.scan_size_nm / 5.0);
-            let bar_frac = bar_nm / img.scan_size_nm;
+            let bar_nm = nice_scale(img.scan_size_x_nm / 5.0);
+            let bar_frac = bar_nm / img.scan_size_x_nm;
             let bar_px = bar_frac * rect.width() * self.zoom;
             let bar_y = rect.max.y - 12.0;
             let bar_x0 = rect.min.x + 10.0;
@@ -799,6 +964,177 @@ impl AfmViewerApp {
         }
     }
 
+    // ── Calibration dialog ────────────────────────────────────────────────────
+
+    /// Per-instrument XY calibration editor. Values take effect on save, which
+    /// reloads the current file so the change is visible immediately.
+    ///
+    /// Edits land in a draft copy rather than in `self.calibration`, because
+    /// `load_file_channel` reads the applied table directly: without the copy,
+    /// deleting or nudging an entry and then closing the window unsaved would
+    /// still change how the *next* file is scaled, while the file on disk — and
+    /// so the next session — disagreed.
+    fn show_calibration_window(&mut self, ctx: &egui::Context) {
+        if !self.show_calibration_window {
+            self.calibration_draft = None;
+            return;
+        }
+
+        let current_id = self.image.as_ref().and_then(|i| i.instrument_id.clone());
+        let has_image = self.image.is_some();
+
+        // The closure owns the draft and the action flags outright, so nothing
+        // inside it has to borrow `self`.
+        let mut draft = self
+            .calibration_draft
+            .take()
+            .unwrap_or_else(|| self.calibration.clone());
+        let mut to_remove: Option<String> = None;
+        let mut add_current = false;
+        let mut do_save = false;
+        let mut open = true;
+
+        egui::Window::new(CALIBRATION_WINDOW_TITLE)
+            .open(&mut open)
+            .default_width(420.0)
+            .show(ctx, |ui| {
+                ui.label("Configure the X/Y and Z scale factors for each instrument.");
+                ui.separator();
+
+                ui.horizontal(|ui| {
+                    ui.label("Current file:");
+                    match &current_id {
+                        Some(id) => {
+                            ui.monospace(id);
+                            if draft.contains(id) {
+                                let c = draft.get(id);
+                                ui.label(format!("X×{:.4} / Y×{:.4} / Z×{:.4}", c.x, c.y, c.z));
+                            } else {
+                                ui.label("Not registered (×1.0)");
+                            }
+                        }
+                        // Distinguish "nothing open" from "open but the header
+                        // carries no serial number" — only the latter is a problem.
+                        None if !has_image => {
+                            ui.weak("(No file open)");
+                        }
+                        None => {
+                            ui.colored_label(
+                                WARN_RED,
+                                "Serial Number could not be read from the header",
+                            );
+                        }
+                    }
+                });
+
+                let can_add = current_id.as_ref().is_some_and(|id| !draft.contains(id));
+                if ui
+                    .add_enabled(can_add, egui::Button::new("Add Current Instrument"))
+                    .clicked()
+                {
+                    add_current = true;
+                }
+
+                ui.separator();
+
+                if draft.is_empty() {
+                    ui.label("No registered instruments.");
+                } else {
+                    egui::Grid::new("calibration_grid")
+                        .num_columns(5)
+                        .striped(true)
+                        .show(ui, |ui| {
+                            ui.label("Serial Number");
+                            ui.label("X Scale");
+                            ui.label("Y Scale");
+                            ui.label("Z Scale");
+                            ui.label("");
+                            ui.end_row();
+
+                            let ids: Vec<String> = draft.iter().map(|(id, _)| id.clone()).collect();
+                            for id in ids {
+                                let is_current = current_id.as_deref() == Some(id.as_str());
+                                if is_current {
+                                    ui.monospace(egui::RichText::new(&id).color(WARN_RED).strong());
+                                } else {
+                                    ui.monospace(&id);
+                                }
+                                if let Some(c) = draft.get_mut(&id) {
+                                    for v in [&mut c.x, &mut c.y, &mut c.z] {
+                                        ui.add(
+                                            egui::DragValue::new(v)
+                                                .speed(0.0001)
+                                                .range(0.1..=10.0)
+                                                // Bound what a *drag* can reach
+                                                // without rewriting what is
+                                                // already there: the file is
+                                                // hand-editable and accepts any
+                                                // positive factor, and egui
+                                                // otherwise clamps the loaded
+                                                // value on sight — merely
+                                                // opening this dialog would
+                                                // round it and the next save
+                                                // would persist the rounding.
+                                                .clamp_existing_to_range(false)
+                                                .max_decimals(4),
+                                        );
+                                    }
+                                }
+                                if ui.button("🗑").on_hover_text("Delete").clicked() {
+                                    to_remove = Some(id.clone());
+                                }
+                                ui.end_row();
+                            }
+                        });
+                }
+
+                ui.separator();
+                if ui.button("💾 Save and Apply").clicked() {
+                    do_save = true;
+                }
+
+                ui.add_space(4.0);
+                if let Some(err) = draft.load_error() {
+                    ui.colored_label(WARN_RED, format!("Error loading calibration file: {err}"));
+                }
+                ui.horizontal_wrapped(|ui| {
+                    ui.label("Calibration file:");
+                    let path = CalibrationTable::path().display().to_string();
+                    if ui
+                        .selectable_label(false, egui::RichText::new(&path).monospace())
+                        .on_hover_text("Click to copy path")
+                        .clicked()
+                    {
+                        ui.ctx().copy_text(path);
+                    }
+                });
+            });
+        self.show_calibration_window = open;
+
+        if let Some(id) = to_remove {
+            draft.remove(&id);
+        }
+        if add_current {
+            if let Some(id) = &current_id {
+                draft.set(id, Calibration::UNITY);
+            }
+        }
+        if do_save {
+            self.calibration = draft.clone();
+            self.set_status(match self.calibration.save() {
+                Ok(()) => ("Calibration values saved.".to_string(), false),
+                Err(e) => (e, true),
+            });
+            // Re-read the file so the new factors are folded into the image.
+            if let Some(idx) = self.selected {
+                self.load_file(ctx, idx);
+            }
+        }
+        // Keep the draft for as long as the window stays open; dropping it on
+        // close means reopening starts from what is actually applied.
+        self.calibration_draft = open.then_some(draft);
+    }
+
     // ── Height Analysis tab ───────────────────────────────────────────────────
 
     fn show_analysis_tab(&mut self, ui: &mut egui::Ui, _ctx: &egui::Context) {
@@ -814,11 +1150,9 @@ impl AfmViewerApp {
                 self.line_p1 = None;
                 self.drag_target = None;
                 self.profile = vec![];
-                self.status_msg.clear();
+                self.set_status((String::new(), false));
             }
-            if !self.status_msg.is_empty() {
-                ui.label(self.status_msg.clone());
-            }
+            self.show_status(ui);
         });
 
         let avail = ui.available_size();
@@ -827,8 +1161,10 @@ impl AfmViewerApp {
 
         ui.horizontal(|ui| {
             // ── image panel ──────────────────────────────────────────────────
-            let (response, painter) =
-                ui.allocate_painter(Vec2::splat(image_side), egui::Sense::click_and_drag());
+            let (response, painter) = ui.allocate_painter(
+                self.image_display_size(image_side),
+                egui::Sense::click_and_drag(),
+            );
             let rect = response.rect;
 
             // Pan
@@ -862,11 +1198,11 @@ impl AfmViewerApp {
                 );
             }
 
-            // Border around image area
+            // Border around image area — red while an XY calibration is applied.
             painter.rect_stroke(
                 rect,
                 0.0,
-                egui::Stroke::new(1.0_f32, egui::Color32::from_gray(100)),
+                self.image_frame_stroke(egui::Stroke::new(1.0_f32, egui::Color32::from_gray(100))),
                 egui::StrokeKind::Outside,
             );
 
@@ -943,13 +1279,16 @@ impl AfmViewerApp {
                             self.line_p0 = Some(frac);
                             self.line_p1 = None;
                             self.profile = vec![];
-                            self.status_msg = "Start set. Click for end.".to_string();
+                            self.set_status(("Start set. Click for end.".to_string(), false));
                         } else {
                             self.line_p1 = Some(frac);
                             if let (Some(p0), Some(ref img)) = (self.line_p0, &self.image) {
                                 self.profile = line_profile(img, (p0.x, p0.y), (frac.x, frac.y));
                             }
-                            self.status_msg = format!("{} profile points", self.profile.len());
+                            self.set_status((
+                                format!("{} profile points", self.profile.len()),
+                                false,
+                            ));
                         }
                     }
                 }
@@ -1034,7 +1373,7 @@ impl AfmViewerApp {
                         .allow_scroll(false)
                         .allow_drag(false)
                         .show(ui, |plot_ui| {
-                            plot_ui.line(Line::new("高さ", curve));
+                            plot_ui.line(Line::new("Height", curve));
 
                             if let Some(xa) = ma {
                                 plot_ui.vline(
@@ -1135,11 +1474,11 @@ impl AfmViewerApp {
                                     egui::Color32::from_rgb(80, 160, 255),
                                     format!("A  {xa:.2} nm,  {ha:.3} nm"),
                                 );
-                                ui.label("← クリックで B を設定");
+                                ui.label("← click to set B");
                             }
                             _ => {
-                                ui.label("プロット上をクリック → A、次のクリック → B");
-                                ui.label("右クリックでクリア");
+                                ui.label("Click the plot → A, click again → B");
+                                ui.label("Right-click to clear");
                             }
                         });
 
@@ -1151,8 +1490,8 @@ impl AfmViewerApp {
                                 .save_file()
                             {
                                 match export_csv(&self.profile, &path) {
-                                    Ok(_) => self.status_msg = "CSV saved.".to_string(),
-                                    Err(e) => self.status_msg = format!("CSV error: {e}"),
+                                    Ok(_) => self.set_status(("CSV saved.".to_string(), false)),
+                                    Err(e) => self.set_status((format!("CSV error: {e}"), true)),
                                 }
                             }
                         }
@@ -1162,18 +1501,18 @@ impl AfmViewerApp {
                                 .save_file()
                             {
                                 match export_profile_png(&self.profile, &path) {
-                                    Ok(_) => self.status_msg = "PNG saved.".to_string(),
-                                    Err(e) => self.status_msg = format!("PNG error: {e}"),
+                                    Ok(_) => self.set_status(("PNG saved.".to_string(), false)),
+                                    Err(e) => self.set_status((format!("PNG error: {e}"), true)),
                                 }
                             }
                         }
-                        if ui.button("マーカークリア").clicked() {
+                        if ui.button("Clear Markers").clicked() {
                             self.plot_marker_a = None;
                             self.plot_marker_b = None;
                         }
                     });
                 } else {
-                    ui.label("(プロフィールなし)");
+                    ui.label("(No profile)");
                 }
             });
         });
@@ -1274,21 +1613,22 @@ impl AfmViewerApp {
                             self.colormap,
                             self.z_min,
                             self.z_max,
-                            img.scan_size_nm,
+                            img.scan_size_x_nm,
                             self.show_scale_bar,
                             &path,
                         ) {
-                            Ok(_) => self.status_msg = "Image saved.".to_string(),
-                            Err(e) => self.status_msg = format!("Save error: {e}"),
+                            Ok(_) => self.set_status(Self::raw_export_note("Image saved.", img)),
+                            Err(e) => self.set_status((format!("Save error: {e}"), true)),
                         }
                     }
                 }
             }
 
-            if !self.status_msg.is_empty() {
-                ui.label(self.status_msg.clone());
+            if let Some(warn) = self.raw_export_warning() {
+                ui.colored_label(WARN_RED, warn);
             }
         });
+        self.show_status(ui);
 
         // rebuild texture when dirty
         if dirty {
@@ -1302,7 +1642,7 @@ impl AfmViewerApp {
         let side = avail.x.min(avail.y) - 20.0;
 
         let (response, painter) =
-            ui.allocate_painter(Vec2::new(side, side), egui::Sense::click_and_drag());
+            ui.allocate_painter(self.image_display_size(side), egui::Sense::click_and_drag());
         let rect = response.rect;
 
         if response.dragged() {
@@ -1334,13 +1674,13 @@ impl AfmViewerApp {
         painter.rect_stroke(
             rect,
             0.0,
-            egui::Stroke::new(5.0_f32, egui::Color32::BLACK),
+            self.image_frame_stroke(egui::Stroke::new(5.0_f32, egui::Color32::BLACK)),
             egui::StrokeKind::Inside,
         );
 
         if let Some(ref img) = self.image {
-            let bar_nm = nice_scale(img.scan_size_nm / 5.0);
-            let bar_px = (bar_nm / img.scan_size_nm) * rect.width() * self.zoom;
+            let bar_nm = nice_scale(img.scan_size_x_nm / 5.0);
+            let bar_px = (bar_nm / img.scan_size_x_nm) * rect.width() * self.zoom;
             let bar_y = rect.max.y - 12.0;
             let bar_x0 = rect.min.x + 10.0;
             painter.line_segment(
@@ -1363,8 +1703,10 @@ impl AfmViewerApp {
     fn show_view3d_tab(&mut self, ui: &mut egui::Ui) {
         // Surface the result of a previous frame's export: the save runs in the
         // paint callback, so its outcome is reported back a frame later.
-        if let Some(msg) = self.export_status.lock().unwrap().take() {
-            self.status_msg = msg;
+        // Bind first so the mutex guard is dropped before `self` is borrowed again.
+        let export_status = self.export_status.lock().unwrap().take();
+        if let Some(status) = export_status {
+            self.set_status(status);
         }
 
         ui.horizontal(|ui| {
@@ -1386,7 +1728,7 @@ impl AfmViewerApp {
             ui.label("Drag: orbit · Right-drag / Shift-drag: pan · Scroll: zoom");
             if !self.status_msg.is_empty() {
                 ui.separator();
-                ui.label(&self.status_msg);
+                self.show_status(ui);
             }
         });
         ui.separator();
@@ -1477,14 +1819,14 @@ impl AfmViewerApp {
             let gl = painter.gl();
             let mut r = renderer.lock().unwrap();
             if let Some(path) = export.as_ref() {
-                let msg = match r.render_to_image(gl, &mvp, light_dir, export_w, export_h) {
+                let status = match r.render_to_image(gl, &mvp, light_dir, export_w, export_h) {
                     Ok(img) => match img.save(path) {
-                        Ok(()) => format!("3D image saved: {}", path.display()),
-                        Err(e) => format!("Save error: {e}"),
+                        Ok(()) => (format!("3D image saved: {}", path.display()), false),
+                        Err(e) => (format!("Save error: {e}"), true),
                     },
-                    Err(e) => format!("Export error: {e}"),
+                    Err(e) => (format!("Export error: {e}"), true),
                 };
-                *export_status.lock().unwrap() = Some(msg);
+                *export_status.lock().unwrap() = Some(status);
                 export_ctx.request_repaint();
             }
             let vp = info.viewport_in_pixels();
@@ -1495,6 +1837,16 @@ impl AfmViewerApp {
             rect,
             callback: Arc::new(cb),
         });
+
+        // Same warning as the 2D tabs: the surface's lateral aspect is scaled.
+        if self.active_calibration().is_some() {
+            ui.painter().rect_stroke(
+                rect,
+                0.0,
+                egui::Stroke::new(3.0_f32, WARN_RED),
+                egui::StrokeKind::Inside,
+            );
+        }
     }
 }
 
@@ -1522,6 +1874,8 @@ impl eframe::App for AfmViewerApp {
                 ui.separator();
                 self.show_file_list(ui, ctx);
             });
+
+        self.show_calibration_window(ctx);
 
         egui::CentralPanel::default().show(ctx, |ui| {
             ui.horizontal(|ui| {
@@ -1562,10 +1916,363 @@ impl eframe::App for AfmViewerApp {
     }
 }
 
-
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn image_with_extents(x_nm: f32, y_nm: f32) -> SpmImage {
+        SpmImage {
+            data: vec![0.0; 4],
+            metadata: std::collections::HashMap::new(),
+            scan_size_x_nm: x_nm,
+            scan_size_y_nm: y_nm,
+            samps_per_line: 2,
+            number_of_lines: 2,
+            channel_name: "Height".into(),
+            channel_idx: 0,
+            available_channels: Vec::new(),
+            instrument_id: Some("10396jvlr".into()),
+            calibration: Calibration::UNITY,
+        }
+    }
+
+    #[test]
+    fn image_display_size_is_square_without_an_image() {
+        let app = AfmViewerApp::default();
+        assert_eq!(app.image_display_size(400.0), egui::vec2(400.0, 400.0));
+    }
+
+    #[test]
+    fn image_display_size_matches_the_true_aspect_and_fits_the_box() {
+        for (x_nm, y_nm) in [(1000.0, 1000.0), (1000.0, 1200.0), (1200.0, 1000.0)] {
+            let app = AfmViewerApp {
+                image: Some(image_with_extents(x_nm, y_nm)),
+                ..Default::default()
+            };
+            let size = app.image_display_size(400.0);
+            assert!(
+                size.x <= 400.0 + 1e-3 && size.y <= 400.0 + 1e-3,
+                "{x_nm}x{y_nm} overflowed the box: {size:?}"
+            );
+            // One axis must touch the box, or the fit is not maximal.
+            assert!(
+                (size.x - 400.0).abs() < 1e-3 || (size.y - 400.0).abs() < 1e-3,
+                "{x_nm}x{y_nm} did not fill the box: {size:?}"
+            );
+            assert!(
+                ((size.x / size.y) - (x_nm / y_nm)).abs() < 1e-4,
+                "{x_nm}x{y_nm} aspect mismatch: {size:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn frame_turns_red_only_while_a_non_unity_calibration_is_applied() {
+        let black = egui::Stroke::new(1.0_f32, egui::Color32::BLACK);
+
+        let mut app = AfmViewerApp {
+            image: Some(image_with_extents(1000.0, 1000.0)),
+            ..Default::default()
+        };
+        assert!(app.active_calibration().is_none());
+        assert_eq!(app.image_frame_stroke(black).color, egui::Color32::BLACK);
+        assert!(app.calibration_summary().is_none());
+
+        let cal = Calibration {
+            x: 1.0,
+            y: 1.2,
+            z: 1.0,
+        };
+        app.image.as_mut().unwrap().apply_calibration(cal);
+        assert_eq!(app.active_calibration(), Some(cal));
+        let stroke = app.image_frame_stroke(black);
+        assert_eq!(stroke.color, WARN_RED);
+        assert!(stroke.width >= 3.0, "red frame should be thicker");
+        let summary = app.calibration_summary().expect("summary while calibrated");
+        assert!(summary.contains("10396jvlr"), "{summary}");
+
+        // Exactly 1.0 on both axes is not a warning.
+        app.image
+            .as_mut()
+            .unwrap()
+            .apply_calibration(Calibration::UNITY);
+        assert!(app.active_calibration().is_none());
+
+        // A Z-only factor changes nothing about the picture's shape, but it
+        // still rescales every height, so it must go red too.
+        app.image.as_mut().unwrap().apply_calibration(Calibration {
+            x: 1.0,
+            y: 1.0,
+            z: 0.9,
+        });
+        assert!(app.active_calibration().is_some());
+        assert_eq!(app.image_frame_stroke(black).color, WARN_RED);
+        let summary = app.calibration_summary().expect("summary while calibrated");
+        assert!(summary.contains("Z×0.9000"), "{summary}");
+    }
+
+    /// Drive the calibration dialog through a real frame and report the rect
+    /// egui gave its window, or `None` when it was not shown.
+    #[allow(deprecated)] // `Context::run` — same as in the file-panel test below.
+    fn run_calibration_window(app: &mut AfmViewerApp) -> Option<egui::Rect> {
+        let ctx = egui::Context::default();
+        let input = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(1200.0, 800.0),
+            )),
+            ..Default::default()
+        };
+        let _ = ctx.run(input, |ctx| app.show_calibration_window(ctx));
+        ctx.memory(|m| m.area_rect(egui::Id::new(CALIBRATION_WINDOW_TITLE)))
+    }
+
+    #[test]
+    fn calibration_dialog_is_shown_only_when_toggled_on() {
+        let mut app = AfmViewerApp::default();
+        assert!(
+            run_calibration_window(&mut app).is_none(),
+            "dialog must stay closed until the toolbar button opens it"
+        );
+
+        app.show_calibration_window = true;
+        let rect = run_calibration_window(&mut app).expect("dialog should be laid out");
+        assert!(
+            rect.width() > 0.0 && rect.height() > 0.0,
+            "dialog rendered empty: {rect:?}"
+        );
+        assert!(app.show_calibration_window, "dialog should stay open");
+    }
+
+    #[test]
+    fn calibration_dialog_renders_entries_and_the_current_instrument() {
+        // A loaded image plus a registered instrument exercises every branch:
+        // the current-file row, the grid with its DragValues, and the
+        // already-registered state of the "add" button.
+        let mut app = AfmViewerApp {
+            image: Some(image_with_extents(1000.0, 1200.0)),
+            show_calibration_window: true,
+            ..Default::default()
+        };
+        app.calibration.set(
+            "10396jvlr",
+            Calibration {
+                x: 1.0,
+                y: 1.2,
+                z: 0.9,
+            },
+        );
+        app.calibration.set("otherscanner", Calibration::UNITY);
+
+        let rect = run_calibration_window(&mut app).expect("dialog should be laid out");
+        assert!(rect.height() > 0.0, "dialog rendered empty: {rect:?}");
+        // Rendering must not disturb the table.
+        assert_eq!(app.calibration.get("10396jvlr").y, 1.2);
+        assert_eq!(app.calibration.iter().count(), 2);
+    }
+
+    #[test]
+    fn rendering_the_dialog_leaves_hand_edited_factors_alone() {
+        // The file is hand-editable and its parser takes any positive factor,
+        // but the editor's DragValues are ranged 0.1..=10. egui clamps an
+        // existing value to a widget's range on sight, so without opting out,
+        // merely opening this dialog would round a hand-written factor and the
+        // next save would write the rounding back to disk.
+        let mut app = AfmViewerApp {
+            show_calibration_window: true,
+            ..Default::default()
+        };
+        let out_of_range = Calibration {
+            x: 0.05,
+            y: 12.0,
+            z: 1.0,
+        };
+        app.calibration.set("scanner", out_of_range);
+
+        run_calibration_window(&mut app).expect("dialog should be laid out");
+
+        assert_eq!(app.calibration.get("scanner"), out_of_range);
+        let draft = app
+            .calibration_draft
+            .as_ref()
+            .expect("the draft outlives a frame while the window is open");
+        assert_eq!(draft.get("scanner"), out_of_range);
+    }
+
+    #[test]
+    fn abandoned_edits_never_reach_the_applied_table() {
+        // `load_file_channel` scales every newly opened image by
+        // `self.calibration`, so an edit that was never saved must not be able
+        // to leak into it — otherwise closing the dialog would leave the app
+        // disagreeing with the file on disk until the next restart.
+        let mut app = AfmViewerApp {
+            show_calibration_window: true,
+            ..Default::default()
+        };
+        app.calibration.set("scanner", Calibration::UNITY);
+
+        run_calibration_window(&mut app).expect("dialog should be laid out");
+        // Stand in for the user editing a value and deleting an entry.
+        let draft = app.calibration_draft.as_mut().expect("draft while open");
+        draft.set(
+            "scanner",
+            Calibration {
+                x: 2.0,
+                y: 2.0,
+                z: 2.0,
+            },
+        );
+        draft.set("added-but-not-saved", Calibration::UNITY);
+
+        assert_eq!(app.calibration.get("scanner"), Calibration::UNITY);
+        assert!(!app.calibration.contains("added-but-not-saved"));
+
+        // Closing the window drops the draft, so reopening starts from what is
+        // actually applied.
+        app.show_calibration_window = false;
+        assert!(run_calibration_window(&mut app).is_none());
+        assert!(app.calibration_draft.is_none());
+        assert_eq!(app.calibration.get("scanner"), Calibration::UNITY);
+    }
+
+    #[test]
+    fn raw_export_note_warns_only_when_the_pixel_grid_is_distorted() {
+        // 2x2 grid, square scan: the raw grid is faithful, so no warning.
+        let img = image_with_extents(1000.0, 1000.0);
+        let (msg, warn) = AfmViewerApp::raw_export_note("Image saved.", &img);
+        assert!(!warn, "square scan should not warn: {msg}");
+        assert_eq!(msg, "Image saved.");
+
+        // Calibrated to 1:1.3 while the grid stays square → warn, and name the
+        // factor the saved file is missing.
+        let mut img = image_with_extents(1000.0, 1000.0);
+        img.apply_calibration(Calibration {
+            x: 1.0,
+            y: 1.3,
+            z: 1.0,
+        });
+        let (msg, warn) = AfmViewerApp::raw_export_note("Image saved.", &img);
+        assert!(warn, "distorted grid must warn");
+        assert!(msg.starts_with("Image saved."), "{msg}");
+        assert!(msg.contains("1.3000"), "factor should be named: {msg}");
+        assert!(msg.contains("2x2 px"), "raw size should be named: {msg}");
+    }
+
+    #[test]
+    fn raw_export_warning_stands_next_to_the_save_buttons() {
+        let mut app = AfmViewerApp::default();
+        assert!(app.raw_export_warning().is_none(), "no image, no warning");
+
+        app.image = Some(image_with_extents(1000.0, 1000.0));
+        assert!(
+            app.raw_export_warning().is_none(),
+            "faithful grid, no warning"
+        );
+
+        app.image.as_mut().unwrap().apply_calibration(Calibration {
+            x: 1.0,
+            y: 1.3,
+            z: 1.0,
+        });
+        let warn = app.raw_export_warning().expect("distorted grid must warn");
+        assert!(warn.contains("1.3000"), "{warn}");
+    }
+
+    #[test]
+    fn status_warning_flag_does_not_leak_into_the_next_message() {
+        let mut app = AfmViewerApp::default();
+        app.set_status(("Save error: nope".to_string(), true));
+        assert!(app.status_warn);
+        app.set_status(("CSV saved.".to_string(), false));
+        assert!(
+            !app.status_warn,
+            "a plain message must not inherit the warning colour"
+        );
+    }
+
+    /// Every `Rect` shape emitted in a frame, flattened out of nested groups.
+    fn collect_rects(shape: &egui::Shape, out: &mut Vec<egui::epaint::RectShape>) {
+        match shape {
+            egui::Shape::Rect(r) => out.push(r.clone()),
+            egui::Shape::Vec(v) => {
+                for s in v {
+                    collect_rects(s, out);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// Render the View tab for one frame and return the rects it painted.
+    #[allow(deprecated)] // `Context::run` — same as in the file-panel test below.
+    fn run_view_tab(img: SpmImage) -> Vec<egui::epaint::RectShape> {
+        let ctx = egui::Context::default();
+        let mut app = AfmViewerApp {
+            z_min: 0.0,
+            z_max: 1.0,
+            ..Default::default()
+        };
+        app.rebuild_texture(&ctx, &img);
+        app.image = Some(img);
+
+        let input = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(1000.0, 1000.0),
+            )),
+            ..Default::default()
+        };
+        let out = ctx.run(input, |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| app.show_view_tab(ui, ctx));
+        });
+
+        let mut rects = Vec::new();
+        for clipped in &out.shapes {
+            collect_rects(&clipped.shape, &mut rects);
+        }
+        rects
+    }
+
+    #[test]
+    fn view_tab_frames_an_uncalibrated_image_in_black_and_square() {
+        let rects = run_view_tab(image_with_extents(1000.0, 1000.0));
+        assert!(
+            !rects.iter().any(|r| r.stroke.color == WARN_RED),
+            "nothing should be red without a calibration"
+        );
+        let frame = rects
+            .iter()
+            .find(|r| r.stroke.color == egui::Color32::BLACK && r.stroke.width > 0.0)
+            .expect("black image frame should be painted");
+        let (w, h) = (frame.rect.width(), frame.rect.height());
+        assert!(
+            (w / h - 1.0).abs() < 1e-3,
+            "expected a square frame: {w}x{h}"
+        );
+    }
+
+    #[test]
+    fn view_tab_frames_a_calibrated_image_in_red_at_the_corrected_aspect() {
+        let mut img = image_with_extents(1000.0, 1000.0);
+        // The instrument stretches Y by 30%: the frame must follow and go red.
+        img.apply_calibration(Calibration {
+            x: 1.0,
+            y: 1.3,
+            z: 1.0,
+        });
+        let rects = run_view_tab(img);
+
+        let frame = rects
+            .iter()
+            .find(|r| r.stroke.color == WARN_RED && r.stroke.width > 0.0)
+            .expect("calibrated image must be framed in red");
+        let (w, h) = (frame.rect.width(), frame.rect.height());
+        assert!(
+            ((w / h) - (1.0 / 1.3)).abs() < 1e-3,
+            "frame should carry the corrected 1:1.3 aspect, got {w}x{h}"
+        );
+        assert!(frame.stroke.width >= 3.0, "red frame should be thicker");
+    }
 
     /// A panel takes the size of its contents, so a filter row that is even a
     /// few pixels too wide pushes the divider further right on *every* frame.
@@ -1591,9 +2298,11 @@ mod tests {
                     ..Default::default()
                 };
                 let _ = ctx.run(input, |ctx| {
-                    egui::Panel::left("file_panel").min_size(200.0).show(ctx, |ui| {
-                        app.show_file_list(ui, ctx);
-                    });
+                    egui::Panel::left("file_panel")
+                        .min_size(200.0)
+                        .show(ctx, |ui| {
+                            app.show_file_list(ui, ctx);
+                        });
                 });
                 egui::containers::PanelState::load(&ctx, egui::Id::new("file_panel"))
                     .expect("panel was shown")

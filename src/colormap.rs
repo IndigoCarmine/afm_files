@@ -111,3 +111,29 @@ fn viridis(t: f32) -> [u8; 3] {
     let b = STOPS[lo][2] + frac * (STOPS[hi][2] - STOPS[lo][2]);
     [(r * 255.0) as u8, (g * 255.0) as u8, (b * 255.0) as u8]
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A Z calibration multiplies the height samples *and* the Z window they
+    /// are mapped through, so the rendered picture comes out byte-identical.
+    /// That is why saved images need no Z warning the way they need an aspect
+    /// one: a Z factor changes the numbers, never the pixels.
+    #[test]
+    fn a_uniform_z_scale_does_not_change_the_rendered_pixels() {
+        let data: Vec<f32> = (0..64).map(|i| i as f32 * 0.7 - 12.0).collect();
+        let (z_min, z_max) = (-12.0_f32, 32.0_f32);
+
+        for k in [0.5_f32, 0.987, 1.3] {
+            let scaled: Vec<f32> = data.iter().map(|v| v * k).collect();
+            for &cmap in Colormap::ALL {
+                assert_eq!(
+                    to_rgba_bytes(&data, 8, 8, cmap, z_min, z_max),
+                    to_rgba_bytes(&scaled, 8, 8, cmap, z_min * k, z_max * k),
+                    "{cmap:?} changed under a x{k} Z calibration"
+                );
+            }
+        }
+    }
+}
