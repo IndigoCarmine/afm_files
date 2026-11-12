@@ -245,7 +245,6 @@ fn decode_image_to_2d(
     samps_per_line: usize,
     number_of_lines: usize,
     bytes_per_pixel: usize,
-    start_context: Option<&String>,
 ) -> Result<Vec<Vec<f32>>, String> {
     let n_pixels = samps_per_line
         .checked_mul(number_of_lines)
@@ -260,30 +259,19 @@ fn decode_image_to_2d(
         ));
     }
 
-    let big_endian = start_context
-        .map(|v| v.to_ascii_uppercase().contains("BIG"))
-        .unwrap_or(false);
-
+    // Nanoscope image data is little-endian. The header's `Start context`
+    // (e.g. `OL1BIG`/`OL2BIG`) is not a byte-order flag: files carrying it are
+    // little-endian too, and Gwyddion's reader ignores it for this purpose.
     let mut flat = Vec::with_capacity(n_pixels);
     match bytes_per_pixel {
         2 => {
             for chunk in data_bytes[..expected_bytes].chunks_exact(2) {
-                let v = if big_endian {
-                    i16::from_be_bytes([chunk[0], chunk[1]])
-                } else {
-                    i16::from_le_bytes([chunk[0], chunk[1]])
-                };
-                flat.push(v as f32);
+                flat.push(i16::from_le_bytes([chunk[0], chunk[1]]) as f32);
             }
         }
         4 => {
             for chunk in data_bytes[..expected_bytes].chunks_exact(4) {
-                let v = if big_endian {
-                    i32::from_be_bytes([chunk[0], chunk[1], chunk[2], chunk[3]])
-                } else {
-                    i32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]])
-                };
-                flat.push(v as f32);
+                flat.push(i32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]) as f32);
             }
         }
         other => {
@@ -857,13 +845,8 @@ pub fn load_spm(
     }
 
     let image_data = &bytes[data_offset..end_offset];
-    let mut image_2d = decode_image_to_2d(
-        image_data,
-        samps_per_line,
-        number_of_lines,
-        bytes_per_pixel,
-        image_block.fields.get("Start context"),
-    )?;
+    let mut image_2d =
+        decode_image_to_2d(image_data, samps_per_line, number_of_lines, bytes_per_pixel)?;
 
     let nm_per_lsb = parse_nm_per_lsb(image_block, &measurement_conditions, bytes_per_pixel)?;
     apply_scale_in_place(&mut image_2d, nm_per_lsb);
@@ -1109,6 +1092,12 @@ mod tests {
     /// terminated by the `\*File list end` marker, padded out to `DATA_OFFSET`,
     /// followed by 4x2 little-endian i16 samples.
     fn write_synthetic_spm(path: &Path) {
+        write_synthetic_spm_with(path, "");
+    }
+
+    /// [`write_synthetic_spm`] with `extra` (whole header lines, each ending in
+    /// a newline) added to the image block.
+    fn write_synthetic_spm_with(path: &Path, extra: &str) {
         const DATA_OFFSET: usize = 1024;
         // Section order and key spellings follow a real MultiMode header: the
         // body's serial appears first, the scanner's second, and the scan list
@@ -1130,10 +1119,11 @@ mod tests {
 \Samps/line: 4
 \Number of lines: 2
 \Bytes/pixel: 2
-\@2:Image Data: S [Height] "Height"
+{extra}\@2:Image Data: S [Height] "Height"
 \@2:Z scale: V [Sens. Zsens] (0.5 nm/LSB) 100 nm
 \*File list end
 "#;
+        let header = header.replace("{extra}", extra);
         let mut bytes = header.as_bytes().to_vec();
         assert!(bytes.len() < DATA_OFFSET);
         bytes.resize(DATA_OFFSET, b' ');
@@ -1163,6 +1153,26 @@ mod tests {
         assert_eq!(img.calibration, Calibration::UNITY);
         // 0.5 nm/LSB applied to the raw counts, rows reversed.
         assert_eq!(img.data, vec![2.0, 2.5, 3.0, 3.5, 0.0, 0.5, 1.0, 1.5]);
+    }
+
+    #[test]
+    fn a_big_start_context_does_not_switch_to_big_endian() {
+        // Instruments write `Start context: OL1BIG` (and `OL2BIG` in the file
+        // list) on files whose samples are little-endian like any other. Reading
+        // them big-endian turned every image into noise without an error.
+        for context in ["OL1BIG", "OL2BIG"] {
+            let path = std::env::temp_dir().join(format!("kintuba_synthetic_{context}.spm"));
+            write_synthetic_spm_with(&path, &format!("\\Start context: {context}\n"));
+
+            let img = load_spm(&path, None, 0.0, None).expect("synthetic file should parse");
+            let _ = std::fs::remove_file(&path);
+
+            assert_eq!(
+                img.data,
+                vec![2.0, 2.5, 3.0, 3.5, 0.0, 0.5, 1.0, 1.5],
+                "{context}"
+            );
+        }
     }
 
     #[test]
